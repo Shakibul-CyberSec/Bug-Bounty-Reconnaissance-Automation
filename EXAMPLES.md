@@ -214,4 +214,4 @@ EOF
 
 ---
 
-For more examples and updates, visit the [GitHub repository](https://github.com/Shakibul-CyberSec/Bug-bounty-recon-pipeline).
+For more examples and updates, visit the [GitHub repository](https://github.com/Shakibul-CyberSec/Bug-Bounty-Reconnaissance-Automation).
