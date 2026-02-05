@@ -18,7 +18,7 @@ Currently supported versions with security updates:
 Instead, please report security vulnerabilities via:
 
 1. **GitHub Security Advisories** (Preferred)
-   - Go to the [Security tab](https://github.com/Shakibul-CyberSec/Bug-bounty-recon-pipeline/security)
+   - Go to the [Security tab](https://github.com/Shakibul-CyberSec/Bug-Bounty-Reconnaissance-Automation/security)
    - Click "Report a vulnerability"
    - Fill in the details
 
@@ -211,7 +211,7 @@ When a security update is released:
 
 ```bash
 # Pull latest changes
-cd Bug-bounty-recon-pipeline
+cd Bug-Bounty-Reconnaissance-Automation
 git pull origin main
 
 # Review changes
