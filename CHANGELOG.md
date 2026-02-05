@@ -277,4 +277,4 @@ Future updates will be documented here as they are released.
 
 ---
 
-[1.0.0]: https://github.com/Shakibul-CyberSec/Bug-bounty-recon-pipeline/releases/tag/v1.0.0
+[1.0.0]: https://github.com/Shakibul-CyberSec/Bug-Bounty-Reconnaissance-Automation/releases/tag/v1.0.0
