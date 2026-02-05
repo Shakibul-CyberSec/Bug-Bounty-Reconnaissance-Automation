@@ -133,7 +133,7 @@ During execution, the pipeline will prompt for:
 ## Output Structure
 
 ```
-recon_v5_YYYYMMDD_HHMMSS/
+recon_YYYYMMDD_HHMMSS/
   |
   +-- target.com/
        |
@@ -347,9 +347,9 @@ curl --socks5 127.0.0.1:9050 https://check.torproject.org
 ```bash
 # Issue: Unable to resume interrupted scan
 # Solution: Check checkpoint file integrity
-cat recon_v5_*/target.com/.recon_state/checkpoint.txt
+cat recon_*/target.com/.recon_state/checkpoint.txt
 # If corrupted, remove state and restart:
-rm -rf recon_v5_*/target.com/.recon_state
+rm -rf recon_*/target.com/.recon_state
 ```
 
 ---
