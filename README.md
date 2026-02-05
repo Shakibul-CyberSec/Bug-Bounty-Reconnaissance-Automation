@@ -30,7 +30,7 @@ Ultra-fast, security-hardened reconnaissance pipeline with 17 specialized phases
 |-----------|-------------|
 | **Operating System** | Linux/Unix (Ubuntu 24.04 recommended) |
 | **Privileges** | Root/sudo access for installation |
-| **Memory** | Minimum 2GB RAM |
+| **Memory** | Minimum 4GB RAM |
 | **Storage** | 10GB free disk space |
 | **Network** | Stable internet connection |
 
@@ -83,7 +83,7 @@ The automated installer will:
 
 # Resume interrupted scan
 ./recon.sh
-# (automatically detects incomplete scans)
+# (Automatically detects incomplete scans. You must be inside the interrupted target’s output folder, e.g., target.com.)
 ```
 
 ### Target File Format
@@ -98,6 +98,7 @@ demo.com
 ### Interactive Prompts
 
 During execution, the pipeline will prompt for:
+- **Scan Mode**: Root domain/Full reconnaissance
 - **Tor Usage**: Enable/disable Tor anonymization
 - **Port Scan Strategy**: Smart scan, full scan, quick scan, or skip
 - **Nuclei Scan**: Run comprehensive vulnerability scan or skip
@@ -110,17 +111,17 @@ During execution, the pipeline will prompt for:
 
 | Phase | Name | Tools | Output Files |
 |-------|------|-------|--------------|
-| **1** | **Subdomain Enumeration** | subfinder, assetfinder, crt.sh, amass, puredns, dnsx, dnsgen | `all_subdomains.txt`, `subfinder.txt`, `assetfinder.txt`, `crt.txt`, `amass_passive.txt`, `puredns.txt`, `dnsgen_resolved.txt` |
-| **2** | **Port Scanning** | naabu, nmap, dig | `portscan/naabu_results.txt`, `portscan/nmap_scan.nmap`, `portscan/ip_analysis.txt`, `portscan/cdn_hosts.txt` |
-| **3** | **HTTP Probing** | httpx | `alive_subdomains.txt`, `alive_subdomains_http.txt`, `alive_subdomains_https.txt` |
-| **4** | **URL Collection** | gau, katana, url-extension | `urls/gau.txt`, `urls/katana.txt`, `all_urls.txt`, `filtered-url-extention/*` |
-| **5** | **JavaScript Analysis** | down, jsscan, httpx | `javascript/js_urls.txt`, `javascript/filtered_js_urls.txt`, `javascript/secrets.txt`, `javascript/endpoints.txt`, `javascript/source_maps.txt` |
-| **5.5** | **API Discovery** | gf, qsreplace | `api_discovery/api_endpoints.txt` |
-| **5.6** | **Cloud Asset Discovery** | cloud_enum | `cloud_assets/cloud_resources.txt` |
-| **5.7** | **WAF Detection** | wafw00f | `waf_detection/waf_results.txt` |
-| **6** | **Nuclei Vulnerability Scan** | nuclei | `nuclei_scan/nuclei_results.txt` |
-| **7** | **Vulnerability Pattern Matching** | gf | `vulnerability_scan/sqli.txt`, `vulnerability_scan/xss.txt`, `vulnerability_scan/ssrf.txt`, `vulnerability_scan/lfi.txt` |
-| **8** | **DNS Reconnaissance** | dig, dnsrecon, whois | `network/dns_records.txt`, `network/whois_info.txt`, `network/subdomain_dig/*`, `network/subdomain_whois/*` |
+| **1** | **Subdomain Enumeration** | subfinder, assetfinder, crt.sh, amass, puredns, dnsx, dnsgen 
+| **2** | **Port Scanning** | naabu, nmap, dig 
+| **3** | **HTTP Probing** | httpx 
+| **4** | **URL Collection** | gau, katana, url-extension
+| **5** | **JavaScript Analysis** | down, jsscan, httpx 
+| **5.5** | **API Discovery** | gf, qsreplace 
+| **5.6** | **Cloud Asset Discovery** | cloud_enum 
+| **5.7** | **WAF Detection** | wafw00f 
+| **6** | **Nuclei Vulnerability Scan** | nuclei 
+| **7** | **Vulnerability Pattern Matching** | gf 
+| **8** | **DNS Reconnaissance** | dig, dnsrecon, whois 
 | **9** | **Visual Screenshots** | gowitness | `gowitness_screenshots/*.png` |
 | **10** | **Technology Fingerprinting** | curl, jq, custom fingerprints | `technology/tech_stack.json`, `technology/tech_summary.txt` |
 | **11** | **Parameter Discovery** | grep, awk (custom) | `parameters/unique_params.txt`, `parameters/cat_redirect.txt`, `parameters/cat_file_path.txt`, `parameters/cat_idor.txt`, `parameters/cat_injection.txt`, `parameters/param_urls.txt` |
