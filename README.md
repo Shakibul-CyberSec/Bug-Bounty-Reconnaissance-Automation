@@ -30,7 +30,7 @@ Ultra-fast, security-hardened reconnaissance pipeline with 17 specialized phases
 |-----------|-------------|
 | **Operating System** | Linux/Unix (Ubuntu 24.04 recommended) |
 | **Privileges** | Root/sudo access for installation |
-| **Memory** | Minimum 4GB RAM |
+| **Memory** | Minimum 2GB RAM |
 | **Storage** | 10GB free disk space |
 | **Network** | Stable internet connection |
 
