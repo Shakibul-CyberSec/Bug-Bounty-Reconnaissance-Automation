@@ -1,5 +1,5 @@
 #!/bin/bash
-# Ultra-Fast Bug Bounty Recon Tool Installer - Enhanced Version v5
+# Ultra-Fast Bug Bounty Recon Tool Installer
 # Author: Shakibul
 
 # Colors for output
@@ -20,7 +20,7 @@ command_exists() {
 show_banner() {
     echo -e "\e[1;36m"
     echo "========================================================="
-    echo "     RECON TOOL INSTALLATION - ENHANCED v5.0           "
+    echo "     RECON TOOL INSTALLATION                        "
     echo "========================================================="
     echo -e "\e[1;32m"
     echo "        Bug Bounty & Penetration Testing Tools"
@@ -133,16 +133,6 @@ EOF
                 ;;
             wafw00f)
                 pip3 install wafw00f --break-system-packages || sudo apt install wafw00f -y
-                ;;
-            cloud_enum)
-                if [ ! -d "/opt/cloud_enum" ]; then
-                    git clone https://github.com/initstring/cloud_enum.git /opt/cloud_enum || return 1
-                fi
-                cd /opt/cloud_enum || return 1
-                pip3 install -r requirements.txt --break-system-packages 2>/dev/null || true
-                sudo ln -sf /opt/cloud_enum/cloud_enum.py /usr/local/bin/cloud_enum
-                sudo chmod +x /opt/cloud_enum/cloud_enum.py
-                cd - >/dev/null 2>&1
                 ;;
             dnsrecon)
                 sudo apt install dnsrecon -y
@@ -367,7 +357,7 @@ show_banner
 echo -e "${YELLOW}[*]${NC} Updating system packages..."
 sudo apt update && sudo apt upgrade -y
 
-# Required tools list - ALL TOOLS USED IN ENHANCED recon_v5.sh
+# Required tools list - ALL TOOLS USED IN recon.sh
 required_tools=(
     # System essentials
     python3 go pip3 git curl wget jq
@@ -384,7 +374,7 @@ required_tools=(
     dnsrecon whois subjack
     
     # Vulnerability scanning & advanced recon
-    nuclei arjun wafw00f cloud_enum
+    nuclei arjun wafw00f
     
     # Local tools
     jsscan down url-extension
@@ -428,7 +418,7 @@ fi
 if $all_installed; then
     echo -e "\n${GREEN}[+]${NC} All tools installed successfully!"
     echo -e "${GREEN}[+]${NC} You can now run the enhanced recon script."
-    echo -e "\n${YELLOW}[*]${NC} Command: ${BLUE}./recon_v5.sh${NC} or ${BLUE}bash recon_v5.sh${NC}"
+    echo -e "\n${YELLOW}[*]${NC} Command: ${BLUE}./recon.sh${NC} or ${BLUE}bash recon.sh${NC}"
 else
     echo -e "\n${YELLOW}[!]${NC} Some tools failed to install. You may need to install them manually."
 fi
