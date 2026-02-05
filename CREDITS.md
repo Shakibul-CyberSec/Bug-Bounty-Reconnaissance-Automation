@@ -125,7 +125,7 @@ This collaboration ensures:
 
 ## 📄 License Compatibility
 
-All integrated tools are compatible with this project's MIT License. Individual tools retain their original licenses.
+All integrated tools are compatible with this project's License. Individual tools retain their original licenses.
 
 ## 🙏 Thank You
 
