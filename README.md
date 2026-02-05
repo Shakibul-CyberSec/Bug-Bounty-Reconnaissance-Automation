@@ -4,7 +4,7 @@
 
 Ultra-fast, security-hardened reconnaissance pipeline with 17 specialized phases covering subdomain enumeration to vulnerability assessment. Built for reliability, scalability, and actionable intelligence gathering.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+![License: Non-Commercial](https://img.shields.io/badge/License-Non--Commercial-red.svg)
 [![Version](https://img.shields.io/badge/version-1.0.0-blue.svg)](https://github.com/Shakibul-CyberSec/Bug-bounty-recon-pipeline/releases)
 [![Bash](https://img.shields.io/badge/bash-5.0%2B-green.svg)](https://www.gnu.org/software/bash/)
 [![Tools](https://img.shields.io/badge/tools-34%2B-brightgreen.svg)](#complete-tool-inventory)
