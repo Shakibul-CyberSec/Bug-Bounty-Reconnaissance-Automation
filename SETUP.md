@@ -27,8 +27,8 @@ lsb_release -a
 
 ### 1. Clone Repository
 ```bash
-git clone https://github.com/Shakibul-CyberSec/Bug-bounty-recon-pipeline.git
-cd Bug-bounty-recon-pipeline
+git clone https://github.com/Shakibul-CyberSec/Bug-Bounty-Reconnaissance-Automation.git
+cd Bug-Bounty-Reconnaissance-Automation
 ```
 
 ### 2. Make Scripts Executable
@@ -167,7 +167,7 @@ sudo swapon /swapfile
 
 ### Update Script
 ```bash
-cd Bug-bounty-recon-pipeline
+cd Bug-Bounty-Reconnaissance-Automation
 git pull origin main
 ```
 
@@ -195,7 +195,7 @@ sudo rm -rf /usr/share/default-recon-resources
 
 # Remove repository
 cd ..
-rm -rf Bug-bounty-recon-pipeline
+rm -rf Bug-Bounty-Reconnaissance-Automation
 ```
 
 ### Remove System Packages
@@ -215,7 +215,7 @@ sudo apt autoremove
 
 If you encounter issues:
 1. Check the troubleshooting section in [README.md](README.md)
-2. Search existing [GitHub Issues](https://github.com/Shakibul-CyberSec/Bug-bounty-recon-pipeline/issues)
+2. Search existing [GitHub Issues](https://github.com/Shakibul-CyberSec/Bug-Bounty-Reconnaissance-Automation/issues)
 3. Create a new issue with detailed information
 
 ---
