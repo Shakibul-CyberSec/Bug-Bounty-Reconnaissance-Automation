@@ -1,833 +1,1874 @@
 #!/usr/bin/env python3
 """
-JSScan Pro - Advanced JavaScript Secret Scanner for Bug Bounty Hunters
-Author: Bug Bounty Tools
-Version: 2.1 Pro - Enhanced Patterns Edition
+JSScan Enterprise Advanced - Next-Generation JavaScript Secret Scanner
+Author: Enterprise Security Tools
+Version: 5.0 Enterprise Edition
+
+All 12 Enhancements Implemented:
+1. AST Parsing for obfuscated secrets
+2. Enhanced entropy with compression ratio
+3. Extended decoding (Hex, Base32, Base85)
+4. ML-based optional scoring
+5. Process-based parallelism
+6. Custom patterns from files
+7. SARIF output format
+8. SQLite-based caching
+9. Context-aware false positive filtering
+10. Unit tests ready
+11. Pre-commit hook support
+12. Performance optimizations
 """
 
 import os
 import re
 import sys
 import json
+import yaml
 import base64
 import hashlib
 import time
-from typing import List, Tuple, Dict, Set, Optional
-from dataclasses import dataclass
-from urllib.parse import urlparse, parse_qs
+import logging
+import sqlite3
+import argparse
+import math
+import urllib.parse
+import zlib
+from pathlib import Path
+from typing import List, Dict, Set, Optional, Tuple, Any
+from dataclasses import dataclass, asdict, field
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+from collections import defaultdict
+import threading
+import multiprocessing
 
+# Optional dependencies
+try:
+    from tqdm import tqdm
+    HAS_TQDM = True
+except ImportError:
+    HAS_TQDM = False
+
+try:
+    import esprima
+    HAS_ESPRIMA = True
+except ImportError:
+    HAS_ESPRIMA = False
+
+try:
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.preprocessing import StandardScaler
+    import pickle
+    HAS_SKLEARN = True
+except ImportError:
+    HAS_SKLEARN = False
+
+# ==================== ENHANCED ENTROPY DETECTION ====================
+
+class EntropyAnalyzer:
+    """Analyze string entropy with compression ratio (Enhancement #2)"""
+    
+    _entropy_cache = {}  # Optimization #12: Cache
+    _cache_lock = threading.Lock()
+    
+    @staticmethod
+    def calculate_shannon_entropy(data: str) -> float:
+        """Calculate Shannon entropy with caching (Enhancement #12)"""
+        if not data:
+            return 0.0
+        
+        # Check cache
+        with EntropyAnalyzer._cache_lock:
+            if data in EntropyAnalyzer._entropy_cache:
+                return EntropyAnalyzer._entropy_cache[data]
+        
+        entropy = 0.0
+        for x in set(data):
+            p_x = float(data.count(x)) / len(data)
+            if p_x > 0:
+                entropy -= p_x * math.log2(p_x)
+        
+        # Cache result (limit size)
+        with EntropyAnalyzer._cache_lock:
+            if len(EntropyAnalyzer._entropy_cache) < 10000:
+                EntropyAnalyzer._entropy_cache[data] = entropy
+        
+        return entropy
+    
+    @staticmethod
+    def calculate_compression_ratio(data: str) -> float:
+        """Calculate compression ratio (Enhancement #2) - Lower = more random"""
+        if not data:
+            return 1.0
+        try:
+            compressed = zlib.compress(data.encode('utf-8'))
+            return len(compressed) / len(data)
+        except:
+            return 1.0
+    
+    @staticmethod
+    def calculate_charset_entropy(data: str) -> Dict[str, float]:
+        """Enhanced analysis with compression (Enhancement #2)"""
+        if not data:
+            return {'entropy': 0.0, 'charset_score': 0.0, 'length': 0, 
+                   'compression_ratio': 1.0, 'repeat_ratio': 0.0}
+        
+        entropy = EntropyAnalyzer.calculate_shannon_entropy(data)
+        compression_ratio = EntropyAnalyzer.calculate_compression_ratio(data)
+        
+        has_lower = any(c.islower() for c in data)
+        has_upper = any(c.isupper() for c in data)
+        has_digit = any(c.isdigit() for c in data)
+        has_special = any(not c.isalnum() for c in data)
+        
+        charset_diversity = sum([has_lower, has_upper, has_digit, has_special])
+        charset_score = charset_diversity / 4.0
+        
+        # Character repetition analysis (Enhancement #2)
+        char_counts = {}
+        for c in data:
+            char_counts[c] = char_counts.get(c, 0) + 1
+        max_repeat = max(char_counts.values()) if char_counts else 0
+        repeat_ratio = max_repeat / len(data) if data else 0
+        
+        return {
+            'entropy': entropy,
+            'charset_score': charset_score,
+            'length': len(data),
+            'has_mixed_case': has_lower and has_upper,
+            'has_digits': has_digit,
+            'has_special': has_special,
+            'compression_ratio': compression_ratio,
+            'repeat_ratio': repeat_ratio
+        }
+    
+    @staticmethod
+    def is_high_entropy_secret(data: str, min_length: int = 20, min_entropy: float = 4.5) -> bool:
+        """Enhanced detection with compression filter (Enhancement #2)"""
+        if len(data) < min_length:
+            return False
+        
+        stats = EntropyAnalyzer.calculate_charset_entropy(data)
+        
+        # High entropy + mixed chars + low compression = likely secret
+        if stats['entropy'] >= min_entropy and stats['charset_score'] >= 0.5:
+            if stats['compression_ratio'] > 0.7:  # Poor compression
+                return True
+        
+        # Very high entropy with poor compression
+        if stats['entropy'] >= 5.0 and len(data) >= 32:
+            if stats['compression_ratio'] > 0.6:
+                return True
+        
+        # Filter repeating patterns (Enhancement #2)
+        if stats['repeat_ratio'] > 0.3:
+            return False
+        
+        return False
+
+# ==================== ENHANCED DECODER & RESCANNER ====================
+
+class SecretDecoder:
+    """Multi-format decoder (Enhancement #3)"""
+    
+    @staticmethod
+    def is_base64(s: str) -> bool:
+        if len(s) < 20:
+            return False
+        return bool(re.match(r'^[A-Za-z0-9+/]+=*$', s)) and (len(s) % 4 == 0 or s.endswith('='))
+    
+    @staticmethod
+    def is_hex(s: str) -> bool:
+        """Check if hex encoded (Enhancement #3)"""
+        if len(s) < 20:
+            return False
+        s_clean = s.replace('0x', '').replace('\\x', '')
+        return bool(re.match(r'^[0-9a-fA-F]+$', s_clean)) and len(s_clean) % 2 == 0
+    
+    @staticmethod
+    def try_decode_base64(s: str) -> Optional[str]:
+        try:
+            decoded = base64.b64decode(s, validate=True).decode('utf-8', errors='ignore')
+            return decoded if decoded and all(c.isprintable() or c.isspace() for c in decoded) else None
+        except:
+            pass
+        try:
+            decoded = base64.urlsafe_b64decode(s + '===').decode('utf-8', errors='ignore')
+            return decoded if decoded and all(c.isprintable() or c.isspace() for c in decoded) else None
+        except:
+            return None
+    
+    @staticmethod
+    def try_decode_hex(s: str) -> Optional[str]:
+        """Hex decoder (Enhancement #3)"""
+        try:
+            s_clean = s.replace('0x', '').replace('\\x', '').replace(' ', '')
+            decoded = bytes.fromhex(s_clean).decode('utf-8', errors='ignore')
+            return decoded if decoded and all(c.isprintable() or c.isspace() for c in decoded) else None
+        except:
+            return None
+    
+    @staticmethod
+    def try_decode_base32(s: str) -> Optional[str]:
+        """Base32 decoder (Enhancement #3)"""
+        try:
+            padding = (8 - len(s) % 8) % 8
+            decoded = base64.b32decode(s + '=' * padding).decode('utf-8', errors='ignore')
+            return decoded if decoded and all(c.isprintable() or c.isspace() for c in decoded) else None
+        except:
+            return None
+    
+    @staticmethod
+    def try_decode_base85(s: str) -> Optional[str]:
+        """Base85 decoder (Enhancement #3)"""
+        try:
+            decoded = base64.a85decode(s).decode('utf-8', errors='ignore')
+            return decoded if decoded and all(c.isprintable() or c.isspace() for c in decoded) else None
+        except:
+            return None
+    
+    @staticmethod
+    def try_decode_url(s: str) -> Optional[str]:
+        try:
+            decoded = urllib.parse.unquote(s)
+            return decoded if decoded != s else None
+        except:
+            return None
+    
+    @staticmethod
+    def decode_and_extract(s: str, max_depth: int = 3) -> List[str]:
+        """Recursive multi-format decoder (Enhancement #3)"""
+        results = [s]
+        seen = {s}
+        
+        def _recursive_decode(text: str, depth: int):
+            if depth >= max_depth:
+                return
+            
+            # Try all decoders
+            decoders = [
+                (SecretDecoder.is_base64(text), SecretDecoder.try_decode_base64),
+                (SecretDecoder.is_hex(text), SecretDecoder.try_decode_hex),
+                (len(text) >= 20 and re.match(r'^[A-Z2-7]+=*$', text), SecretDecoder.try_decode_base32),
+                (True, SecretDecoder.try_decode_base85),
+                (True, SecretDecoder.try_decode_url)
+            ]
+            
+            for should_try, decoder_func in decoders:
+                if should_try:
+                    decoded = decoder_func(text)
+                    if decoded and decoded not in seen:
+                        seen.add(decoded)
+                        results.append(decoded)
+                        _recursive_decode(decoded, depth + 1)
+        
+        _recursive_decode(s, 0)
+        return results
+
+# ==================== AST PARSER ====================
+
+class ASTSecretExtractor:
+    """Extract secrets from JavaScript AST (Enhancement #1)
+    
+    Fixed bugs:
+    - Bug A: esprima returns Objects (not dicts), must use getattr() not .get()
+    - Bug B: BinaryExpression (string concat) must be joined before pattern matching
+    """
+    
+    def __init__(self):
+        self.enabled = HAS_ESPRIMA
+    
+    def _get_attr(self, node, attr, default=None):
+        """Safe attribute getter that works on both esprima objects and dicts"""
+        if node is None:
+            return default
+        if isinstance(node, dict):
+            return node.get(attr, default)
+        return getattr(node, attr, default)
+    
+    def _get_line(self, node) -> int:
+        """Extract line number from esprima node"""
+        try:
+            loc = self._get_attr(node, 'loc')
+            if loc:
+                start = self._get_attr(loc, 'start')
+                if start:
+                    return self._get_attr(start, 'line', 0)
+        except:
+            pass
+        return 0
+    
+    def _join_binary_expression(self, node) -> str:
+        """
+        Recursively join BinaryExpression string concatenation.
+        'ghp_' + '1234567890' + 'abcdefghij...' -> 'ghp_1234567890abcdefghij...'
+        Returns the joined string or '' if non-string operands found.
+        """
+        if node is None:
+            return ''
+        node_type = self._get_attr(node, 'type', '')
+        
+        if node_type == 'Literal':
+            val = self._get_attr(node, 'value', '')
+            return str(val) if isinstance(val, str) else ''
+        
+        if node_type == 'BinaryExpression':
+            op = self._get_attr(node, 'operator', '')
+            if op == '+':
+                left = self._join_binary_expression(self._get_attr(node, 'left'))
+                right = self._join_binary_expression(self._get_attr(node, 'right'))
+                if left is not None and right is not None:
+                    return left + right
+        
+        if node_type == 'TemplateLiteral':
+            parts = []
+            for quasi in (self._get_attr(node, 'quasis') or []):
+                val = self._get_attr(self._get_attr(quasi, 'value'), 'raw', '')
+                parts.append(val or '')
+            return ''.join(parts)
+        
+        return ''
+    
+    def extract_from_code(self, code: str) -> List[Tuple[str, str, int]]:
+        """Returns: List of (value, context, line_number)"""
+        if not self.enabled:
+            return []
+        try:
+            tree = esprima.parseScript(code, tolerant=True, loc=True)
+            secrets = []
+            self._walk_node(tree, secrets, code)
+            return secrets
+        except Exception:
+            return []
+    
+    def _walk_node(self, node, secrets: List, code: str):
+        """Walk esprima AST using proper object attribute access"""
+        if node is None:
+            return
+        
+        node_type = self._get_attr(node, 'type', '')
+        
+        # Direct string literal
+        if node_type == 'Literal':
+            value = self._get_attr(node, 'value', '')
+            if isinstance(value, str) and len(value) >= 16:
+                line = self._get_line(node)
+                context = self._get_context(code, line)
+                secrets.append((value, context, line))
+        
+        # Template literal: `some ${expr} text`
+        elif node_type == 'TemplateLiteral':
+            line = self._get_line(node)
+            context = self._get_context(code, line)
+            for quasi in (self._get_attr(node, 'quasis') or []):
+                raw = self._get_attr(self._get_attr(quasi, 'value'), 'raw', '')
+                if raw and len(raw) >= 16:
+                    secrets.append((raw, context, line))
+        
+        # String concatenation: "ghp_" + "12345..." + "abcdef..."
+        elif node_type == 'BinaryExpression':
+            op = self._get_attr(node, 'operator', '')
+            if op == '+':
+                joined = self._join_binary_expression(node)
+                if joined and len(joined) >= 16:
+                    line = self._get_line(node)
+                    context = self._get_context(code, line)
+                    secrets.append((joined, context, line))
+                    return  # Don't walk children - we already joined them
+        
+        # Variable declarator: catch secrets in suspicious variable names
+        elif node_type == 'VariableDeclarator':
+            id_node = self._get_attr(node, 'id')
+            id_name = self._get_attr(id_node, 'name', '') if id_node else ''
+            init = self._get_attr(node, 'init')
+            
+            if init and any(kw in id_name.lower() for kw in
+                            ['key', 'secret', 'token', 'password', 'auth', 'credential',
+                             'api', 'private', 'access', 'signing', 'encryption']):
+                # Handle direct literal
+                if self._get_attr(init, 'type') == 'Literal':
+                    val = self._get_attr(init, 'value', '')
+                    if isinstance(val, str) and len(val) >= 8:
+                        line = self._get_line(node)
+                        secrets.append((val, f"var {id_name} = '{val}'", line))
+                # Handle concatenation
+                elif self._get_attr(init, 'type') == 'BinaryExpression':
+                    joined = self._join_binary_expression(init)
+                    if joined and len(joined) >= 8:
+                        line = self._get_line(node)
+                        secrets.append((joined, f"var {id_name} = '{joined}'", line))
+        
+        # Recursively walk all child nodes using esprima object attributes
+        self._walk_children(node, secrets, code)
+    
+    def _walk_children(self, node, secrets: List, code: str):
+        """Walk all child nodes of an esprima object"""
+        if node is None:
+            return
+        
+        # Child node fields for common AST node types
+        child_fields = [
+            'body', 'declarations', 'expression', 'init', 'test', 'update',
+            'consequent', 'alternate', 'left', 'right', 'argument', 'arguments',
+            'callee', 'object', 'property', 'elements', 'properties', 'value',
+            'key', 'id', 'params', 'defaults', 'rest', 'cases', 'handler',
+            'finalizer', 'block', 'param', 'guardedHandlers', 'specifiers',
+            'source', 'declaration', 'imported', 'local'
+        ]
+        
+        for field in child_fields:
+            child = self._get_attr(node, field)
+            if child is None:
+                continue
+            if isinstance(child, list):
+                for item in child:
+                    if item is not None and hasattr(item, 'type'):
+                        self._walk_node(item, secrets, code)
+            elif hasattr(child, 'type'):
+                self._walk_node(child, secrets, code)
+    
+    def _get_context(self, code: str, line_num: int) -> str:
+        try:
+            lines = code.split('\n')
+            if 0 < line_num <= len(lines):
+                return lines[line_num - 1].strip()[:200]
+        except:
+            pass
+        return ""
+
+
+# ==================== ML CLASSIFIER ====================
+
+class MLSecretClassifier:
+    """Optional ML-based classifier (Enhancement #4)"""
+    
+    def __init__(self, model_path: Optional[str] = None):
+        self.enabled = HAS_SKLEARN
+        self.model = None
+        self.scaler = None
+        if self.enabled and model_path and os.path.exists(model_path):
+            self.load_model(model_path)
+    
+    def extract_features(self, value: str, context: str, file_path: str) -> List[float]:
+        stats = EntropyAnalyzer.calculate_charset_entropy(value)
+        return [
+            stats['entropy'],
+            stats['charset_score'],
+            stats['length'],
+            float(stats['has_mixed_case']),
+            float(stats['has_digits']),
+            float(stats['has_special']),
+            stats['compression_ratio'],
+            stats['repeat_ratio'],
+            float(any(kw in context.lower() for kw in ['key', 'secret', 'token', 'password'])),
+            float(any(kw in file_path.lower() for kw in ['.env', 'config', 'secret'])),
+            float(value.startswith(('sk_', 'pk_', 'ghp_', 'xoxb-', 'AKIA'))),
+            float(bool(re.search(r'[A-Z]{2,}', value))),
+            float(bool(re.search(r'\d{3,}', value))),
+            float(bool(re.search(r'[+/=]', value))),
+        ]
+    
+    def predict(self, value: str, context: str, file_path: str) -> Tuple[bool, float]:
+        if not self.enabled or not self.model:
+            return False, 0.0
+        try:
+            features = self.extract_features(value, context, file_path)
+            features_scaled = self.scaler.transform([features])
+            prediction = self.model.predict(features_scaled)[0]
+            confidence = self.model.predict_proba(features_scaled)[0][1]
+            return bool(prediction), float(confidence)
+        except:
+            return False, 0.0
+    
+    def load_model(self, model_path: str):
+        try:
+            with open(model_path, 'rb') as f:
+                data = pickle.load(f)
+                self.model = data['model']
+                self.scaler = data['scaler']
+        except:
+            pass
+
+
+# ==================== CONTEXT-AWARE FILTER ====================
+
+class ContextAwareFPFilter:
+    """NLP-style false positive filtering (Enhancement #9)"""
+    
+    @staticmethod
+    def looks_like_path(value: str) -> bool:
+        if ('/' in value or '\\' in value) and not value.startswith('http'):
+            parts = value.replace('\\', '/').split('/')
+            if len(parts) >= 2:
+                return all(part.replace('.', '').replace('-', '').replace('_', '').isalnum() 
+                          for part in parts if part)
+        return False
+    
+    @staticmethod
+    def looks_like_url(value: str) -> bool:
+        if value.startswith(('http://', 'https://', 'ftp://', 'file://')):
+            # Check if has credentials
+            return not ('@' in value and ':' in value.split('@')[0])
+        return False
+    
+    @staticmethod
+    def looks_like_hash(value: str) -> bool:
+        if len(value) in [32, 40, 64] and re.match(r'^[0-9a-fA-F]+$', value):
+            return value.islower() or value.isupper()
+        return False
+    
+    @staticmethod
+    def is_in_comment(context: str) -> bool:
+        context = context.strip()
+        return (context.startswith(('//','#')) or 
+               ('/*' in context and '*/' in context))
+    
+    @staticmethod
+    def should_filter(value: str, context: str, secret_type: str) -> Tuple[bool, Optional[str]]:
+        # Don't filter high-confidence patterns
+        if any(p in secret_type for p in ['GitHub', 'Stripe', 'AWS Access Key', 'Slack Bot']):
+            return False, None
+        
+        if ContextAwareFPFilter.looks_like_path(value):
+            return True, "looks_like_path"
+        if ContextAwareFPFilter.looks_like_url(value):
+            return True, "looks_like_url"
+        if ContextAwareFPFilter.looks_like_hash(value):
+            return True, "looks_like_hash"
+        
+        return False, None
+
+# ==================== SCORING SYSTEM ====================
+
+@dataclass
+class SecretScore:
+    entropy_score: float = 0.0
+    pattern_score: float = 0.0
+    context_score: float = 0.0
+    length_score: float = 0.0
+    variable_name_score: float = 0.0
+    file_location_score: float = 0.0
+    compression_score: float = 0.0
+    ml_score: float = 0.0
+    total_score: float = 0.0
+    confidence_level: str = "low"
+    
+    def calculate_total(self) -> float:
+        self.total_score = sum([self.entropy_score, self.pattern_score, self.context_score,
+                               self.length_score, self.variable_name_score, self.file_location_score,
+                               self.compression_score, self.ml_score])
+        self.confidence_level = "high" if self.total_score >= 10.0 else "medium" if self.total_score >= 6.0 else "low"
+        return self.total_score
+
+
+class SecretScorer:
+    SECRET_VAR_NAMES = {'api_key', 'apikey', 'api_secret', 'secret', 'token', 'access_token',
+                        'private_key', 'privatekey', 'password', 'passwd', 'pwd', 'credential',
+                        'auth', 'authorization', 'secret_key', 'secretkey', 'access_key'}
+    
+    SUSPICIOUS_FILES = {'.env', 'config.js', 'config.json', 'credentials', 'secrets',
+                       'settings.js', 'constants.js', '.npmrc'}
+    
+    @staticmethod
+    def score_secret(value: str, context: str, file_path: str, 
+                     pattern_matched: Optional[str] = None,
+                     is_high_confidence_pattern: bool = False,
+                     ml_classifier: Optional[MLSecretClassifier] = None) -> SecretScore:
+        score = SecretScore()
+        
+        # Entropy (0-3)
+        stats = EntropyAnalyzer.calculate_charset_entropy(value)
+        if stats['entropy'] >= 5.5:
+            score.entropy_score = 3.0
+        elif stats['entropy'] >= 5.0:
+            score.entropy_score = 2.5
+        elif stats['entropy'] >= 4.5:
+            score.entropy_score = 2.0
+        elif stats['entropy'] >= 4.0:
+            score.entropy_score = 1.0
+        
+        # Compression (0-2) - Enhancement #2
+        if stats['compression_ratio'] > 0.8:
+            score.compression_score = 2.0
+        elif stats['compression_ratio'] > 0.7:
+            score.compression_score = 1.5
+        elif stats['compression_ratio'] > 0.6:
+            score.compression_score = 1.0
+        
+        # Pattern (0-5)
+        if is_high_confidence_pattern:
+            score.pattern_score = 5.0
+        elif pattern_matched:
+            score.pattern_score = 3.0
+        
+        # Context (0-2)
+        for var in SecretScorer.SECRET_VAR_NAMES:
+            if var in context.lower():
+                score.context_score = 2.0
+                break
+        
+        # Length (0-1)
+        score.length_score = 1.0 if len(value) >= 40 else 0.8 if len(value) >= 32 else 0.5 if len(value) >= 24 else 0
+        
+        # Variable name (0-2)
+        var_match = re.search(r'(?:const|let|var|=)\s+([a-zA-Z_][a-zA-Z0-9_]*)', context)
+        if var_match:
+            var_name = var_match.group(1).lower()
+            if any(sn in var_name for sn in SecretScorer.SECRET_VAR_NAMES):
+                score.variable_name_score = 2.0
+        
+        # File location (0-2)
+        if any(sf in file_path.lower() for sf in SecretScorer.SUSPICIOUS_FILES):
+            score.file_location_score = 2.0
+        
+        # ML (0-3) - Enhancement #4
+        if ml_classifier and ml_classifier.enabled:
+            is_secret, ml_conf = ml_classifier.predict(value, context, file_path)
+            if is_secret:
+                score.ml_score = ml_conf * 3.0
+        
+        score.calculate_total()
+        return score
+
+
+# ==================== SQLITE CACHE ====================
+
+class FileHashCache:
+    """SQLite-based cache (Enhancement #8)"""
+    
+    def __init__(self, cache_db: str = ".jssscan_cache.db"):
+        self.cache_db = cache_db
+        self.conn = None
+        self._init_db()
+    
+    def _init_db(self):
+        self.conn = sqlite3.connect(self.cache_db, check_same_thread=False)
+        self.conn.execute('''
+            CREATE TABLE IF NOT EXISTS file_cache (
+                file_path TEXT PRIMARY KEY,
+                file_hash TEXT NOT NULL,
+                last_scanned TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        self.conn.execute('CREATE INDEX IF NOT EXISTS idx_file_path ON file_cache(file_path)')
+        self.conn.commit()
+    
+    def get_file_hash(self, file_path: str) -> str:
+        hasher = hashlib.sha256()
+        try:
+            with open(file_path, 'rb') as f:
+                for chunk in iter(lambda: f.read(4096), b''):
+                    hasher.update(chunk)
+            return hasher.hexdigest()
+        except:
+            return ""
+    
+    def should_scan(self, file_path: str) -> bool:
+        current_hash = self.get_file_hash(file_path)
+        if not current_hash:
+            return True
+        
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT file_hash FROM file_cache WHERE file_path = ?', (file_path,))
+        row = cursor.fetchone()
+        return not row or current_hash != row[0]
+    
+    def update(self, file_path: str):
+        current_hash = self.get_file_hash(file_path)
+        if current_hash:
+            self.conn.execute('''
+                INSERT OR REPLACE INTO file_cache (file_path, file_hash, last_scanned)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+            ''', (file_path, current_hash))
+            self.conn.commit()
+    
+    def save(self):
+        if self.conn:
+            self.conn.commit()
+    
+    def close(self):
+        if self.conn:
+            self.conn.close()
+
+# ==================== DATA MODELS ====================
 
 @dataclass
 class SecretFinding:
-    """Data class for secret findings"""
     secret_type: str
     value: str
     context: str
     line_num: int
-    confidence: str  # high, medium, low
+    confidence: str
     file_path: str
     is_minified: bool = False
+    severity: str = "medium"
+    cwe_id: Optional[str] = None
+    remediation: Optional[str] = None
+    first_seen: str = field(default_factory=lambda: datetime.now().isoformat())
+    last_seen: str = field(default_factory=lambda: datetime.now().isoformat())
+    finding_id: Optional[str] = None
+    entropy: float = 0.0
+    score: float = 0.0
+    score_breakdown: Optional[Dict] = None
+    decoded_from: Optional[str] = None
+    detection_method: str = "pattern"
+    fp_filter_reason: Optional[str] = None
+    
+    def __post_init__(self):
+        if not self.finding_id:
+            content = f"{self.file_path}:{self.line_num}:{self.secret_type}:{self.value}"
+            self.finding_id = hashlib.sha256(content.encode()).hexdigest()[:16]
+        self.severity = self._calculate_severity()
+        self.cwe_id = "CWE-798"
+        self.remediation = ("1. Remove hardcoded secret\n2. Rotate credential\n"
+                           "3. Use env vars or secrets manager\n4. Add to CI/CD scan\n"
+                           "5. Review git history")
+    
+    def _calculate_severity(self) -> str:
+        # Secrets found in comments are always low severity
+        if self.confidence == "low":
+            return "low"
+        
+        critical = ['AWS Access Key ID', 'AWS Secret Access Key', 'Stripe Secret Key', 
+                   'MongoDB URL', 'PostgreSQL URL', 'MySQL URL', 'Redis URL', 'Cassandra URL',
+                   'GitHub Personal Access Token', 'Slack Bot Token', 'Slack Webhook URL',
+                   'SendGrid API Key', 'SSH RSA Private Key', 'SSH EC Private Key',
+                   'Twilio Account SID', 'Private Key Env',
+                   'MS Teams Webhook', 'Outlook Webhook Legacy']
+        high = ['Google API Key', 'GitHub OAuth Token', 'JWT Token',
+               'NPM Access Token', 'Twilio Auth Token', 'Mailgun API Key',
+               'Database Password', 'Encryption Key', 'Signing Secret',
+               'API Key in URL', 'Token in URL']
+        
+        if self.score >= 12.0 and self.entropy >= 4.5:
+            return "critical"
+        if self.confidence == "high":
+            if any(t in self.secret_type for t in critical):
+                return "critical"
+            elif any(t in self.secret_type for t in high):
+                return "high"
+        return "medium" if self.confidence == "medium" else "low"
+    
+    def to_dict(self) -> Dict:
+        return asdict(self)
 
 
-class JSScanPro:
-    def __init__(self, aggressive_mode: bool = False):
-        """
-        Initialize the scanner
+@dataclass
+class ScanConfig:
+    aggressive_mode: bool = False
+    max_workers: int = 4
+    max_file_size_mb: int = 10
+    scan_minified: bool = True
+    excluded_dirs: List[str] = field(default_factory=lambda: [
+        '.git', 'node_modules', '__pycache__', '.idea', '.vscode', 
+        'dist', 'build', 'vendor', '.next', 'coverage'])
+    included_extensions: List[str] = field(default_factory=lambda: [
+        '.js', '.jsx', '.ts', '.tsx', '.json', '.html', '.vue', '.mjs'])
+    log_level: str = "INFO"
+    enable_database: bool = False
+    database_path: str = "jssscan.db"
+    export_formats: List[str] = field(default_factory=lambda: ["json"])
+    enable_entropy_scan: bool = True
+    entropy_threshold: float = 4.5
+    min_secret_length: int = 20
+    enable_decode_rescan: bool = True
+    enable_scoring: bool = True
+    score_threshold: float = 5.0
+    enable_file_cache: bool = False
+    cache_file: str = ".jssscan_cache.db"
+    enable_ast_parsing: bool = True
+    enable_ml_classifier: bool = False
+    ml_model_path: Optional[str] = None
+    custom_patterns_file: Optional[str] = None
+    use_process_pool: bool = True
+    enable_context_filter: bool = True
+
+
+@dataclass
+class ScanMetrics:
+    start_time: float = field(default_factory=time.time)
+    end_time: Optional[float] = None
+    files_scanned: int = 0
+    files_skipped: int = 0
+    files_cached: int = 0
+    lines_scanned: int = 0
+    findings_total: int = 0
+    findings_by_confidence: Dict[str, int] = field(default_factory=lambda: {'high': 0, 'medium': 0, 'low': 0})
+    findings_by_severity: Dict[str, int] = field(default_factory=lambda: {'critical': 0, 'high': 0, 'medium': 0, 'low': 0, 'info': 0})
+    findings_by_method: Dict[str, int] = field(default_factory=lambda: {'pattern': 0, 'entropy': 0, 'decoded': 0, 'ast': 0})
+    false_positives_filtered: int = 0
+    context_filtered: int = 0
+    secrets_decoded: int = 0
+    ast_secrets_found: int = 0
+    errors: int = 0
+    
+    def duration(self) -> float:
+        return (self.end_time or time.time()) - self.start_time
+    
+    def to_dict(self) -> Dict:
+        data = asdict(self)
+        data['duration_seconds'] = self.duration()
+        return data
+
+
+# ==================== SARIF EXPORTER ====================
+
+class SARIFExporter:
+    """SARIF 2.1.0 export (Enhancement #7)"""
+    
+    @staticmethod
+    def generate_sarif(results: Dict[str, List[SecretFinding]], scan_id: str, metrics: ScanMetrics) -> Dict:
+        rules = {}
+        for findings in results.values():
+            for f in findings:
+                if f.secret_type not in rules:
+                    rule_id = f.secret_type.replace(' ', '_').replace('(', '').replace(')', '')
+                    rules[f.secret_type] = {
+                        "id": rule_id,
+                        "name": f.secret_type,
+                        "shortDescription": {"text": f"Detected {f.secret_type}"},
+                        "help": {"text": f.remediation},
+                        "properties": {
+                            "tags": ["security", "secrets", f.severity],
+                            "security-severity": "8.0" if f.severity == "critical" else 
+                                               "6.0" if f.severity == "high" else "4.0"
+                        }
+                    }
         
-        Args:
-            aggressive_mode: If True, use more patterns (may have more false positives)
-        """
-        self.aggressive_mode = aggressive_mode
+        sarif_results = []
+        for file_path, findings in results.items():
+            for f in findings:
+                rule_id = f.secret_type.replace(' ', '_').replace('(', '').replace(')', '')
+                sarif_results.append({
+                    "ruleId": rule_id,
+                    "level": "error" if f.severity in ["critical", "high"] else "warning",
+                    "message": {"text": f"{f.secret_type} detected"},
+                    "locations": [{
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": file_path},
+                            "region": {"startLine": f.line_num, "snippet": {"text": f.context[:200]}}
+                        }
+                    }],
+                    "partialFingerprints": {"primaryLocationLineHash": f.finding_id},
+                    "properties": {"entropy": f.entropy, "score": f.score, "confidence": f.confidence}
+                })
         
-        # ===== HIGH CONFIDENCE PATTERNS (Very specific, low false positives) =====
+        return {
+            "version": "2.1.0",
+            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+            "runs": [{
+                "tool": {
+                    "driver": {
+                        "name": "JSScan Advanced",
+                        "version": "5.0",
+                        "rules": list(rules.values())
+                    }
+                },
+                "results": sarif_results,
+                "properties": {"scan_id": scan_id, "metrics": metrics.to_dict()}
+            }]
+        }
+
+# ==================== HTML EXPORTER ====================
+
+class HTMLExporter:
+    """Generate beautiful HTML reports"""
+    
+    @staticmethod
+    def generate_html(results: Dict[str, List[SecretFinding]], scan_id: str, metrics: ScanMetrics) -> str:
+        total_findings = sum(len(findings) for findings in results.values())
+        
+        # Group findings by severity
+        findings_by_severity = {'critical': [], 'high': [], 'medium': [], 'low': []}
+        for file_path, findings in results.items():
+            for f in findings:
+                findings_by_severity[f.severity].append((file_path, f))
+        
+        html = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>JSScan Security Report - {scan_id}</title>
+    <style>
+        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+        body {{
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            padding: 20px;
+            color: #333;
+        }}
+        .container {{
+            max-width: 1400px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 12px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+        }}
+        .header {{
+            background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+        }}
+        .header h1 {{
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.2);
+        }}
+        .header .subtitle {{
+            font-size: 1.1em;
+            opacity: 0.9;
+        }}
+        .metrics {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 20px;
+            padding: 30px;
+            background: #f8f9fa;
+            border-bottom: 3px solid #e9ecef;
+        }}
+        .metric-card {{
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            text-align: center;
+            transition: transform 0.2s;
+        }}
+        .metric-card:hover {{
+            transform: translateY(-5px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        }}
+        .metric-value {{
+            font-size: 2.5em;
+            font-weight: bold;
+            color: #2a5298;
+            margin-bottom: 5px;
+        }}
+        .metric-label {{
+            color: #6c757d;
+            font-size: 0.9em;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }}
+        .severity-summary {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 15px;
+            padding: 30px;
+            background: white;
+        }}
+        .severity-card {{
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            color: white;
+            font-weight: bold;
+            font-size: 1.2em;
+        }}
+        .severity-critical {{ background: linear-gradient(135deg, #c0392b 0%, #e74c3c 100%); }}
+        .severity-high {{ background: linear-gradient(135deg, #d35400 0%, #e67e22 100%); }}
+        .severity-medium {{ background: linear-gradient(135deg, #f39c12 0%, #f1c40f 100%); }}
+        .severity-low {{ background: linear-gradient(135deg, #27ae60 0%, #2ecc71 100%); }}
+        .findings-section {{
+            padding: 30px;
+        }}
+        .section-title {{
+            font-size: 1.8em;
+            margin-bottom: 20px;
+            padding-bottom: 10px;
+            border-bottom: 3px solid #2a5298;
+            color: #1e3c72;
+        }}
+        .finding-card {{
+            background: white;
+            border-left: 5px solid;
+            margin-bottom: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            overflow: hidden;
+            transition: all 0.3s;
+        }}
+        .finding-card:hover {{
+            box-shadow: 0 4px 16px rgba(0,0,0,0.15);
+            transform: translateX(5px);
+        }}
+        .finding-card.critical {{ border-left-color: #e74c3c; }}
+        .finding-card.high {{ border-left-color: #e67e22; }}
+        .finding-card.medium {{ border-left-color: #f1c40f; }}
+        .finding-card.low {{ border-left-color: #2ecc71; }}
+        .finding-header {{
+            padding: 20px;
+            background: #f8f9fa;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }}
+        .finding-title {{
+            font-size: 1.2em;
+            font-weight: bold;
+            color: #2c3e50;
+        }}
+        .finding-badges {{
+            display: flex;
+            gap: 10px;
+        }}
+        .badge {{
+            padding: 5px 12px;
+            border-radius: 20px;
+            font-size: 0.85em;
+            font-weight: bold;
+            color: white;
+        }}
+        .badge-critical {{ background: #e74c3c; }}
+        .badge-high {{ background: #e67e22; }}
+        .badge-medium {{ background: #f39c12; }}
+        .badge-low {{ background: #27ae60; }}
+        .badge-method {{ background: #3498db; }}
+        .finding-body {{
+            padding: 20px;
+        }}
+        .finding-detail {{
+            margin-bottom: 15px;
+        }}
+        .detail-label {{
+            font-weight: bold;
+            color: #2c3e50;
+            margin-right: 10px;
+        }}
+        .detail-value {{
+            color: #555;
+        }}
+        .secret-value {{
+            background: #f8f9fa;
+            padding: 10px;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            overflow-x: auto;
+            border: 1px solid #dee2e6;
+            color: #c0392b;
+            font-weight: bold;
+        }}
+        .context-code {{
+            background: #2c3e50;
+            color: #ecf0f1;
+            padding: 15px;
+            border-radius: 5px;
+            font-family: 'Courier New', monospace;
+            overflow-x: auto;
+            margin-top: 10px;
+            font-size: 0.9em;
+        }}
+        .file-path {{
+            color: #3498db;
+            font-family: monospace;
+            font-size: 0.9em;
+        }}
+        .footer {{
+            background: #2c3e50;
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }}
+        .footer p {{
+            margin-bottom: 10px;
+        }}
+        @media print {{
+            body {{ background: white; }}
+            .container {{ box-shadow: none; }}
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔒 JSScan Security Report</h1>
+            <div class="subtitle">Enterprise JavaScript Secret Scanner v5.0</div>
+            <div class="subtitle">Scan ID: {scan_id} | Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</div>
+        </div>
+        
+        <div class="metrics">
+            <div class="metric-card">
+                <div class="metric-value">{metrics.files_scanned}</div>
+                <div class="metric-label">Files Scanned</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">{metrics.lines_scanned:,}</div>
+                <div class="metric-label">Lines Analyzed</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">{total_findings}</div>
+                <div class="metric-label">Total Findings</div>
+            </div>
+            <div class="metric-card">
+                <div class="metric-value">{metrics.duration():.2f}s</div>
+                <div class="metric-label">Scan Duration</div>
+            </div>
+        </div>
+        
+        <div class="severity-summary">
+            <div class="severity-card severity-critical">
+                <div style="font-size: 2em;">🔥 {metrics.findings_by_severity['critical']}</div>
+                <div>Critical</div>
+            </div>
+            <div class="severity-card severity-high">
+                <div style="font-size: 2em;">🔴 {metrics.findings_by_severity['high']}</div>
+                <div>High</div>
+            </div>
+            <div class="severity-card severity-medium">
+                <div style="font-size: 2em;">🟡 {metrics.findings_by_severity['medium']}</div>
+                <div>Medium</div>
+            </div>
+            <div class="severity-card severity-low">
+                <div style="font-size: 2em;">🟢 {metrics.findings_by_severity['low']}</div>
+                <div>Low</div>
+            </div>
+        </div>
+"""
+        
+        # Add findings by severity
+        for severity in ['critical', 'high', 'medium', 'low']:
+            severity_findings = findings_by_severity[severity]
+            if severity_findings:
+                severity_emoji = {'critical': '🔥', 'high': '🔴', 'medium': '🟡', 'low': '🟢'}
+                html += f"""
+        <div class="findings-section">
+            <div class="section-title">{severity_emoji[severity]} {severity.upper()} Severity Findings ({len(severity_findings)})</div>
+"""
+                for file_path, finding in severity_findings:
+                    method_badge = finding.detection_method.upper()
+                    html += f"""
+            <div class="finding-card {severity}">
+                <div class="finding-header">
+                    <div class="finding-title">{finding.secret_type}</div>
+                    <div class="finding-badges">
+                        <span class="badge badge-{severity}">{severity.upper()}</span>
+                        <span class="badge badge-method">{method_badge}</span>
+                    </div>
+                </div>
+                <div class="finding-body">
+                    <div class="finding-detail">
+                        <span class="detail-label">📁 File:</span>
+                        <span class="file-path">{file_path}</span>
+                        <span class="detail-label">Line:</span>
+                        <span class="detail-value">{finding.line_num}</span>
+                    </div>
+                    <div class="finding-detail">
+                        <span class="detail-label">🔑 Secret Value:</span>
+                        <div class="secret-value">{finding.value[:100]}{'...' if len(finding.value) > 100 else ''}</div>
+                    </div>
+                    <div class="finding-detail">
+                        <span class="detail-label">📊 Entropy:</span>
+                        <span class="detail-value">{finding.entropy:.2f}</span>
+                        <span class="detail-label">Score:</span>
+                        <span class="detail-value">{finding.score:.2f}</span>
+                        <span class="detail-label">Confidence:</span>
+                        <span class="detail-value">{finding.confidence}</span>
+                    </div>
+                    <div class="finding-detail">
+                        <span class="detail-label">📝 Context:</span>
+                        <div class="context-code">{finding.context[:300]}</div>
+                    </div>
+                    <div class="finding-detail">
+                        <span class="detail-label">⚠️ CWE:</span>
+                        <span class="detail-value">{finding.cwe_id}</span>
+                    </div>
+                </div>
+            </div>
+"""
+                html += "        </div>\n"
+        
+        # Footer
+        html += f"""
+        <div class="footer">
+            <p><strong>Detection Methods Summary</strong></p>
+            <p>📋 Pattern: {metrics.findings_by_method['pattern']} | 
+               🎲 Entropy: {metrics.findings_by_method['entropy']} | 
+               🔓 Decoded: {metrics.findings_by_method['decoded']} | 
+               🌳 AST: {metrics.findings_by_method['ast']}</p>
+            <p>🚫 False Positives Filtered: {metrics.false_positives_filtered} | 
+               🧹 Context Filtered: {metrics.context_filtered}</p>
+            <p style="margin-top: 20px; opacity: 0.8;">Generated by JSScan Advanced v5.0 Enterprise Edition</p>
+        </div>
+    </div>
+</body>
+</html>"""
+        return html
+
+# ==================== MAIN SCANNER ====================
+
+class JSScanAdvanced:
+    """Enterprise scanner with all 12 enhancements"""
+    
+    def __init__(self, config: ScanConfig, logger: Optional[logging.Logger] = None):
+        self.config = config
+        self.logger = logger or self._setup_logger()
+        self.metrics = ScanMetrics()
+        self._lock = threading.Lock()
+        
+        # Initialize components
+        self.file_cache = FileHashCache(config.cache_file) if config.enable_file_cache else None
+        self.ast_extractor = ASTSecretExtractor() if config.enable_ast_parsing else None
+        self.ml_classifier = MLSecretClassifier(config.ml_model_path) if config.enable_ml_classifier else None
+        self.context_filter = ContextAwareFPFilter() if config.enable_context_filter else None
+        
+        self._init_patterns()
+        self._init_false_positives()
+        
+        # Load custom patterns (Enhancement #6)
+        if config.custom_patterns_file and os.path.exists(config.custom_patterns_file):
+            self._load_custom_patterns(config.custom_patterns_file)
+        
+        self.logger.info(f"JSScan v5.0 initialized with {len(self.compiled_patterns)} patterns")
+    
+    def _setup_logger(self) -> logging.Logger:
+        logger = logging.Logger("jssscan")
+        logger.setLevel(getattr(logging, self.config.log_level))
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+        logger.addHandler(handler)
+        return logger
+    
+    def _load_custom_patterns(self, path: str):
+        """Load custom patterns (Enhancement #6)"""
+        try:
+            with open(path, 'r') as f:
+                custom = json.load(f) if path.endswith('.json') else yaml.safe_load(f)
+            for name, pattern in custom.items():
+                self.all_patterns[name] = pattern
+                self.compiled_patterns[name] = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+            self.logger.info(f"Loaded {len(custom)} custom patterns")
+        except Exception as e:
+            self.logger.error(f"Failed to load custom patterns: {e}")
+    
+    def _init_patterns(self):
         self.high_confidence_patterns = {
-            # Google API Keys (very specific format) - UPDATED: More flexible length
             "Google API Key": r'\bAIza[0-9A-Za-z\-_]{35,40}\b',
-            
-            # AWS Keys (specific formats) - UPDATED: Allow 16-20 chars for AWS Access Key
-            "AWS Access Key ID": r'\bAKIA[0-9A-Z]{16,20}\b',
-            # AWS Secret Key (40 chars base64) - NEW: Standalone pattern
-            "AWS Secret Key": r'\b[A-Za-z0-9+/]{40}\b',
-            # AWS Secret with context - UPDATED: More flexible
-            "AWS Secret Key (context)": r'(?i)(?:aws[_-]?)?secret[_-]?(?:access[_-]?)?key\s*[=:]\s*["\']([A-Za-z0-9+/]{40})["\']',
-            
-            # Stripe Keys - UPDATED: Allow longer keys
+            "AWS Access Key ID": r'\bAKIA[0-9A-Z]{16,}\b',
+            "AWS Access Key Config": r'(?i)AWS_ACCESS_KEY_ID["\']?\s*[=:]\s*["\']?(AKIA[0-9A-Z]{16,})["\']?',
+            "AWS Secret Access Key": r'(?i)(?:aws|secret).{0,30}(?:secret|key).{0,30}["\']([A-Za-z0-9/+=]{40,})["\']',
             "Stripe Secret Key": r'\bsk_(?:test|live)_[a-zA-Z0-9]{24,}\b',
-            "Stripe Publishable Key": r'\bpk_(?:test|live)_[a-zA-Z0-9]{24,}\b',
-            
-            # GitHub Tokens - UPDATED: Allow 36+ chars
-            "GitHub Token": r'\bgh[pousr]_[A-Za-z0-9_]{36,}\b',
-            
-            # Slack Tokens - UPDATED: Better pattern
-            "Slack Token": r'\bxox[baprs]-[0-9a-zA-Z-]{10,}\b',
-            
-            # Heroku API Key (UUID format)
-            "Heroku API Key": r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b',
-            
-            # Firebase - NEW: Specific API key pattern
-            "Firebase API Key": r'\bAIza[0-9A-Za-z\-_]{35,}\b.*firebase',
-            
-            # Twilio
-            "Twilio Account SID": r'\bAC[a-fA-F0-9]{32}\b',
-            "Twilio Auth Token": r'\b[a-fA-F0-9]{32}\b',
-            "Twilio API Key": r'\bSK[a-fA-F0-9]{32}\b',
-            
-            # Mailgun
-            "Mailgun API Key": r'\bkey-[0-9a-fA-F]{32}\b',
-            
-            # SendGrid - NEW
-            "SendGrid API Key": r'\bSG\.[a-zA-Z0-9-_]{22}\.[a-zA-Z0-9-_]{43}\b',
-            
-            # JWT Token - NEW: More accurate pattern
+            "GitHub Personal Access Token": r'\bghp_[A-Za-z0-9]{36,}\b',
+            "Slack Bot Token": r'\bxoxb-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,}\b',
+            "Slack Webhook URL": r'https://hooks\.slack\.com/services/[A-Za-z0-9]{8,12}/[A-Za-z0-9]{8,12}/[A-Za-z0-9]{24,}',
+            "SendGrid API Key": r'\bSG\.[a-zA-Z0-9-_]{20,}\.[a-zA-Z0-9-_]{40,}\b',
             "JWT Token": r'\beyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]*\b',
-            
-            # Database URLs - NEW: More specific patterns
             "MongoDB URL": r'mongodb(?:\+srv)?://[a-zA-Z0-9_]+:[^@\s]+@[^\s"\']+',
             "PostgreSQL URL": r'postgres(?:ql)?://[a-zA-Z0-9_]+:[^@\s]+@[^\s"\']+',
             "MySQL URL": r'mysql://[a-zA-Z0-9_]+:[^@\s]+@[^\s"\']+',
-            
-            # Generic 40-char base64 (likely AWS or similar) - NEW
-            "40-char Base64 Secret": r'\b[A-Za-z0-9+/]{40}\b',
-            
-            # Generic 32-char hex (likely API key) - NEW
-            "32-char Hex Secret": r'\b[a-fA-F0-9]{32}\b',
-            
-            # Slack webhook URL - NEW
-            "Slack Webhook URL": r'https://hooks\.slack\.com/services/T[A-Z0-9]{8}/B[A-Z0-9]{8}/[A-Za-z0-9]+',
+            "Redis URL": r'redis://(?:[^:]*:)?[^@\s]+@[^\s"\']+',
+            "Cassandra URL": r'cassandra://[a-zA-Z0-9_]+:[^@\s]+@[^\s"\']+',
+            "Twilio Account SID": r'\bAC[0-9a-fA-F]{32}\b',
+            "SSH RSA Private Key": r'-----BEGIN (?:RSA |OPENSSH )?PRIVATE KEY-----',
+            "SSH EC Private Key": r'-----BEGIN EC PRIVATE KEY-----',
+            "API Key in URL": r'[?&]api[_-]?key=([a-zA-Z0-9_\-]{20,})',
+            "Token in URL": r'[?&]token=([a-zA-Z0-9_\-]{20,})',
+            "MS Teams Webhook": r'https://[a-zA-Z0-9]+\.webhook\.office\.com/webhookb2/[a-zA-Z0-9\-]+@[a-zA-Z0-9\-]+/IncomingWebhook/[a-zA-Z0-9]+/[a-zA-Z0-9\-]+',
+            "Outlook Webhook Legacy": r'https://outlook\.office\.com/webhook/[a-fA-F0-9\-]{36}@[a-fA-F0-9\-]{36}/IncomingWebhook/[a-zA-Z0-9]+/[a-fA-F0-9\-]{36}',
         }
         
-        # ===== MEDIUM CONFIDENCE PATTERNS (Require context validation) =====
         self.medium_confidence_patterns = {
-            # JWTs with validation - KEEP: for validation
-            "JWT Token (medium)": r'\beyJ[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*\.[a-zA-Z0-9_-]*\b',
-            
-            # API Keys in assignments (must have keyword) - UPDATED: Better capture
-            "API Key Assignment": r'(?i)(?:api[_-]?key|access[_-]?key)\s*[=:]\s*["\']([a-zA-Z0-9_\-=+/]{20,100})["\']',
-            
-            # Secrets in assignments - UPDATED: Better capture
-            "Secret Assignment": r'(?i)(?:secret|client[_-]?secret|api[_-]?secret|private[_-]?key)\s*[=:]\s*["\']([a-zA-Z0-9_\-=+/]{20,100})["\']',
-            
-            # Tokens in assignments - UPDATED: Better capture
-            "Token Assignment": r'(?i)(?:token|access[_-]?token|bearer[_-]?token|refresh[_-]?token|id[_-]?token)\s*[=:]\s*["\']([a-zA-Z0-9_\-=+/]{20,100})["\']',
-            
-            # Passwords in assignments - UPDATED: Better capture
-            "Password Assignment": r'(?i)(?:password|passwd|pwd|pass)\s*[=:]\s*["\']([^\s"\']{8,128})["\']',
-            
-            # Database URLs with credentials - UPDATED: More inclusive
-            "Database URL with Auth": r'(?i)(?:mysql|postgres|mongodb|redis)://[a-zA-Z0-9_]+:[^@\s]+@[^\s"\']+',
-            
-            # URLs with tokens in query params - UPDATED
-            "URL with Auth Param": r'https?://[^\s"\']*[?&](?:token|key|secret|auth|apikey|access[_-]?token)=([a-zA-Z0-9_\-=+/]{20,128})',
-            
-            # Config objects with secrets - NEW
-            "Config Object Secret": r'(?i)(?:apiKey|secret|token|password|accessKey)\s*:\s*["\']([a-zA-Z0-9_\-=+/]{20,100})["\']',
-            
-            # Environment variable style - NEW
-            "Env Variable Secret": r'(?i)(?:[A-Z_]+[A-Z0-9_]*)\s*=\s*["\']([a-zA-Z0-9_\-=+/@#$%^&*!]{8,128})["\']',
-            
-            # Export statements with secrets - NEW
-            "Export with Secret": r'(?i)export\s+(?:const|let|var|default).*?=\s*["\']([a-zA-Z0-9_\-=+/]{20,100})["\']',
+            "API Key Assignment": r'(?i)(?:api[_-]?key)\s*[=:]\s*["\']([a-zA-Z0-9_\-=+/]{20,100})["\']',
+            "Secret Assignment": r'(?i)(?:secret)\s*[=:]\s*["\']([a-zA-Z0-9_\-=+/]{20,100})["\']',
+            "Token Assignment": r'(?i)(?:token)\s*[=:]\s*["\']([a-zA-Z0-9_\-=+/]{20,100})["\']',
+            "Password Assignment": r'(?i)(?:password|passwd|pwd)\s*[=:]\s*["\']([^"\']{8,})["\']',
+            "Twilio Auth Token": r'(?i)(?:twilio|auth).{0,30}(?:token|auth)["\']?\s*[=:]\s*["\']([a-fA-F0-9]{32})["\']',
+            "Azure Client ID": r'(?i)(?:azure|client).{0,20}(?:id|client_id)["\']?\s*[=:]\s*["\']([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})["\']',
+            "Azure Tenant ID": r'(?i)(?:tenant|azure).{0,20}(?:id|tenant_id)["\']?\s*[=:]\s*["\']([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})["\']',
+            "Braintree Merchant ID": r'(?i)(?:braintree).{0,20}(?:merchant).{0,20}id["\']?\s*[=:]\s*["\']([a-zA-Z0-9]{20,})["\']',
+            "Plaid Client ID": r'(?i)(?:plaid).{0,20}(?:client).{0,20}id["\']?\s*[=:]\s*["\']([a-zA-Z0-9]{20,})["\']',
+            "Encryption Key": r'(?i)(?:encryption|encrypt).{0,20}key["\']?\s*[=:]\s*["\']([a-zA-Z0-9_\-=+/]{20,})["\']',
+            "Signing Secret": r'(?i)(?:slack|signing).{0,30}(?:signing|secret).{0,20}["\']?\s*[=:]\s*["\']([a-fA-F0-9]{20,})["\']',
+            "Generic Hex Token": r'(?i)(?:token|auth|secret|key).{0,30}["\']?\s*[=:]\s*["\']([a-fA-F0-9]{32,40})["\']',
+            "Database Password": r'(?i)(?:database|db).{0,20}(?:password|passwd)["\']?\s*[=:]\s*["\']([^"\']{8,})["\']',
+            "Private Key Env": r'(?i)(?:private).{0,20}key["\']?\s*[=:]\s*["\']([^"\']{20,})["\']',
         }
         
-        # ===== AGGRESSIVE MODE PATTERNS (More patterns, more false positives) =====
-        self.aggressive_patterns = {
-            "Base64 String (long)": r'\b(?:[A-Za-z0-9+/]{40,}={0,2}|[A-Za-z0-9+/]{60,}={0,2})\b',
-            "Hex String (long)": r'\b(?:0x)?[a-fA-F0-9]{40,}\b',
-            "Generic Credential": r'(?i)(?:user(?:name)?|login|email)\s*[=:]\s*["\'][^"\']+["\']\s*[,\n].*?(?:pass(?:word|wd)?)\s*[=:]\s*["\'][^"\']+["\']',
-            "Potential Secret String": r'["\'][A-Za-z0-9_\-=+/@#$%^&*!]{20,100}["\']',
-            "URL with Credentials": r'://[^:]+:[^@]+@',
-            "UUID String": r'\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b',
-        }
-        
-        # ===== COMPILE PATTERNS =====
         self.all_patterns = {}
         self.all_patterns.update(self.high_confidence_patterns)
         self.all_patterns.update(self.medium_confidence_patterns)
         
-        if self.aggressive_mode:
-            self.all_patterns.update(self.aggressive_patterns)
-        
-        self.compiled_patterns = {
-            name: re.compile(pattern, re.IGNORECASE) 
-            for name, pattern in self.all_patterns.items()
-        }
-        
-        # ===== FALSE POSITIVE DATABASE =====
-        # Common words, paths, and known false positives
-        self.false_positives = {
-            # Common words
-            'null', 'undefined', 'true', 'false', 'example', 'test', 'demo', 
-            'dummy', 'placeholder', 'changeme', 'password123', 'test123',
-            'admin', 'root', 'user', 'guest', 'default', 'example_token_123',
-            'test_api_key_1234567890', 'YOUR_API_KEY_HERE',
-            
-            # WordPress/Drupal specific
-            'dashicons-visibility', 'dashicons-hidden', 'wp-content',
-            'wp-admin', 'wp-includes', 'admin-ajax.php',
-            
-            # Common JavaScript methods/properties
-            'getelementbyid', 'queryselector', 'addeventlistener',
-            'innerhtml', 'textcontent', 'createelement',
-            
-            # Common API endpoints (not secrets)
-            'api/v1', 'api/v2', 'graphql', 'rest', 'oauth',
-            
-            # Archive.org specific (from your output)
-            'org/services/img/metropolitanmuseumofart',
-            'machine/fpnmgdkabkmnadcjpehmlllkndpkmiak',
-            'machine/kjmickeoogghaimmomagaghnogelpcpn',
-            
-            # Test patterns from our test file
-            'd41d8cd98f00b204e9800998ecf8427e',  # MD5 of empty string
-            'ff5733',  # Part of hex color
-            
-            # Common false positives
-            'github.com', 'gitlab.com', 'bitbucket.org', 'localhost',
-            '127.0.0.1', '0.0.0.0', 'example.com', 'test.com',
-        }
-        
-        # False positive patterns (regex)
-        self.false_positive_patterns = [
-            # URLs and paths - MORE SPECIFIC
-            r'https?://(?:www\.)?[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:/[^\s"\']*)?',  # URLs
-            r'/[a-zA-Z0-9_\-/.]+\.(?:js|css|html|png|jpg|jpeg|gif|svg|ico)',  # File paths with extensions
-            r'www\.[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}',  # Websites
-            r'\.[a-z]{2,6}(?::\d+)?(?:/[\w\-./]*)?',  # Domain-like patterns
-            
-            # JavaScript code patterns
-            r'function\s+\w+\s*\(',  # Function definitions
-            r'class\s+\w+',  # Class definitions
-            r'\.prototype\.',  # Prototype methods
-            r'\.(?:exports|module)\s*=',  # Module exports
-            r'^\s*(?:var|let|const|export|import|function|class)',  # Declarations
-            
-            # HTML/CSS patterns
-            r'<[a-zA-Z][^>]*>',  # HTML tags
-            r'\.(?:css|js|png|jpg|jpeg|gif|svg|ico|woff|woff2|ttf|eot)\b',  # File extensions
-            r'#[a-fA-F0-9]{3,6}',  # Hex colors
-            r'url\([^)]+\)',  # CSS URLs
-            r'data:image/[^;]+;base64,[a-zA-Z0-9+/=]+',  # Base64 images
-            
-            # Common libraries/frameworks
-            r'(?:jquery|react|vue|angular|axios|lodash|moment|underscore)\.',  # Library calls
-            r'\.min\.(?:js|css)',  # Minified files marker
-            
-            # Comments
-            r'//.*example.*|/\*.*example.*\*/',  # Example in comments
-            r'//.*test.*|/\*.*test.*\*/',  # Test in comments
-            
-            # Common patterns that look like secrets but aren't
-            r'[0-9a-fA-F]{8}-0000-0000-0000-[0-9a-fA-F]{12}',  # Generic UUID
-            r'[0-9]{4}-[0-9]{2}-[0-9]{2}',  # Date pattern
-            r'[0-9]+\.[0-9]+\.[0-9]+',  # Version numbers
-        ]
-        
-        self.compiled_fp_patterns = [re.compile(p, re.IGNORECASE) for p in self.false_positive_patterns]
-        
-        # File extensions to scan
-        self.scannable_extensions = {'.js', '.jsx', '.ts', '.tsx', '.mjs', '.cjs', '.json'}
-        
-        # Statistics
-        self.stats = {
-            'files_scanned': 0,
-            'minified_files': 0,
-            'findings_high': 0,
-            'findings_medium': 0,
-            'findings_low': 0,
-            'false_positives_filtered': 0,
-        }
-
-    def is_minified_file(self, content: str, file_path: str) -> bool:
-        """Advanced minification detection"""
-        if not content or len(content) < 100:
-            return False
-        
-        filename = os.path.basename(file_path).lower()
-        
-        # Check filename for minified indicators
-        if '.min.js' in filename or '.min.css' in filename:
+        self.compiled_patterns = {n: re.compile(p, re.IGNORECASE | re.MULTILINE) 
+                                 for n, p in self.all_patterns.items()}
+    
+    def _init_false_positives(self):
+        self.false_positives = {'null', 'undefined', 'true', 'false', 'example', 'test', 
+                               'demo', 'dummy', 'placeholder', 'YOUR_API_KEY_HERE'}
+    
+    def is_false_positive(self, value: str, secret_type: str, context: str = "") -> bool:
+        if value.lower() in self.false_positives:
             return True
         
-        # Calculate metrics
-        lines = content.split('\n')
-        line_count = len(lines)
-        
-        if line_count == 0:
-            return False
-        
-        avg_line_length = len(content) / line_count
-        
-        # Count whitespace vs characters
-        sample_size = min(5000, len(content))
-        whitespace_chars = sum(1 for c in content[:sample_size] if c.isspace())
-        whitespace_ratio = whitespace_chars / sample_size if sample_size > 0 else 0
-        
-        # Check for minified indicators
-        minified_indicators = [
-            avg_line_length > 400,  # Very long lines
-            whitespace_ratio < 0.05,  # Very little whitespace
-            line_count < 10 and len(content) > 1000,  # Few lines but large content
-            all(len(line.strip()) > 300 for line in lines[:10] if line.strip()),  # First 10 lines are long
-            'function(' in content and '){' in content and ';' in content and '\n' not in content[:500],  # Minified function
-            # Additional heuristic: very few different characters in first 100 chars
-            len(set(content[:100])) < 20,
-        ]
-        
-        return any(minified_indicators)
-
-    def validate_jwt(self, token: str) -> bool:
-        """Validate if a JWT is likely real (not test/example)"""
-        parts = token.split('.')
-        if len(parts) != 3:
-            return False
-        
-        try:
-            # Decode header
-            header = parts[0] + '=' * (4 - len(parts[0]) % 4)
-            header_decoded = base64.b64decode(header).decode('utf-8', errors='ignore')
-            header_data = json.loads(header_decoded)
-            
-            # Check for valid JWT algorithm
-            if 'alg' not in header_data:
-                return False
-            
-            # Decode payload
-            payload = parts[1] + '=' * (4 - len(parts[1]) % 4)
-            payload_decoded = base64.b64decode(payload).decode('utf-8', errors='ignore')
-            payload_data = json.loads(payload_decoded)
-            
-            # Check for test indicators
-            test_indicators = ['test', 'example', 'demo', 'fake', 'dummy', 'placeholder', 'changeme']
-            payload_str = str(payload_data).lower()
-            
-            if any(indicator in payload_str for indicator in test_indicators):
-                return False
-            
-            # Check expiration if present
-            if 'exp' in payload_data:
-                if payload_data['exp'] < time.time():
-                    return False  # Expired token
-            
-            # Check issued at if present
-            if 'iat' in payload_data:
-                if payload_data['iat'] > time.time() + 3600:  # Issued in the future (more than 1 hour)
-                    return False
-            
-            return True
-            
-        except:
-            return False
-
-    def validate_base64(self, value: str) -> bool:
-        """Validate if a string is likely a real base64 secret (not random text)"""
-        if not value or len(value) < 20:
-            return False
-        
-        # Check if it's valid base64
-        try:
-            # Remove any padding
-            clean_value = value.replace('=', '')
-            
-            # Check character distribution (real base64 has more variety)
-            unique_chars = set(clean_value)
-            if len(unique_chars) < 10:  # Not enough character variety
-                return False
-            
-            # Check for common false positives
-            false_positives = [
-                'dashicons', 'wp-content', 'wp-admin', 'wp-includes',
-                'jquery', 'react', 'vue', 'angular', 'axios'
-            ]
-            if any(fp in value.lower() for fp in false_positives):
-                return False
-            
-            # Try to decode
-            padding = '=' * (4 - len(value) % 4)
-            decoded = base64.b64decode(value + padding)
-            
-            # Check if decoded looks like text (might be a secret)
-            try:
-                text = decoded.decode('utf-8', errors='ignore')
-                # If it decodes to readable text, check if it looks like a secret
-                if len(text) > 10:
-                    # Check for common secret patterns in decoded text
-                    secret_indicators = ['key', 'secret', 'token', 'password', 'access', 'private', 'credential']
-                    if any(indicator in text.lower() for indicator in secret_indicators):
-                        return True
-                    # If it looks like JSON, it might be a JWT payload or config
-                    if text.strip().startswith('{') and text.strip().endswith('}'):
-                        return True
-            except:
-                # Binary data - could be a real secret
-                if len(decoded) > 10:  # Reasonable length for a secret
-                    return True
-            
-            return False
-            
-        except:
-            return False
-
-    def validate_hex(self, value: str) -> bool:
-        """Validate if a hex string is likely a secret"""
-        if not value or len(value) < 20:
-            return False
-        
-        # Remove 0x prefix if present
-        clean_value = value.lower().replace('0x', '')
-        
-        # Must be valid hex
-        if not all(c in '0123456789abcdef' for c in clean_value):
-            return False
-        
-        # Check length - common secret lengths
-        if len(clean_value) in [32, 40, 64]:  # MD5, SHA1, SHA256
-            # Check if it's a common hash of empty string or test values
-            common_hashes = {
-                'd41d8cd98f00b204e9800998ecf8427e',  # MD5 of empty string
-                'da39a3ee5e6b4b0d3255bfef95601890afd80709',  # SHA1 of empty string
-                'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',  # SHA256 of empty string
-            }
-            if clean_value in common_hashes:
-                return False
-            
-            # Check character distribution (real secrets have more randomness)
-            unique_chars = set(clean_value)
-            if len(unique_chars) < 8:  # Not enough character variety
-                return False
-            
-            return True
+        # Context-aware filter (Enhancement #9)
+        if self.context_filter:
+            should_filter, reason = self.context_filter.should_filter(value, context, secret_type)
+            if should_filter:
+                with self._lock:
+                    self.metrics.context_filtered += 1
+                return True
         
         return False
-
-    def analyze_context(self, line: str, value: str, secret_type: str) -> Tuple[bool, str]:
-        """
-        Analyze the context around a match to determine if it's likely a real secret
-        
-        Returns: (is_valid, confidence)
-        """
-        line_lower = line.lower()
-        value_lower = value.lower()
-        
-        # 1. Check against false positive database
-        if value_lower in self.false_positives:
-            self.stats['false_positives_filtered'] += 1
-            return False, "false_positive"
-        
-        # 2. Check against false positive patterns
-        for pattern in self.compiled_fp_patterns:
-            if pattern.search(line):
-                self.stats['false_positives_filtered'] += 1
-                return False, "false_positive_pattern"
-        
-        # 3. Check for common programming constructs
-        programming_constructs = [
-            r'\.(?:get|set|has|is|to|from)[A-Z]',  # Method names
-            r'function\s+\w+',  # Function names
-            r'class\s+\w+',  # Class names
-            r'\.prototype\.',  # Prototype
-            r'console\.(?:log|warn|error|info|debug)',  # Console calls
-            r'require\(|import\s',  # Imports
-            r'export\s',  # Exports
-            r'\.then\(|\.catch\(|\.finally\(',  # Promise methods
-            r'\.map\(|\.filter\(|\.reduce\(|\.forEach\(',  # Array methods
-        ]
-        
-        for construct in programming_constructs:
-            if re.search(construct, line, re.IGNORECASE):
-                self.stats['false_positives_filtered'] += 1
-                return False, "programming_construct"
-        
-        # 4. Check if value is too common/simple
-        if len(value) < 10:
-            self.stats['false_positives_filtered'] += 1
-            return False, "too_short"
-        
-        # 5. Check for assignment context (high confidence)
-        assignment_patterns = [
-            r'(?:const|let|var|export\s+default|export\s+(?:const|let|var))\s+\w+\s*=\s*["\']' + re.escape(value) + r'["\']',
-            r'\b(?:api[_-]?key|secret|token|password|access[_-]?key|private[_-]?key)\s*[=:]\s*["\']' + re.escape(value) + r'["\']',
-        ]
-        
-        for pattern in assignment_patterns:
-            if re.search(pattern, line, re.IGNORECASE):
-                return True, "high"
-        
-        # 6. Check if it's in an object/configuration (high confidence)
-        object_patterns = [
-            r'(?:apiKey|secret|token|password|accessKey|privateKey|clientSecret|authToken)\s*:\s*["\']' + re.escape(value) + r'["\']',
-            r'["\'][^"\']+["\']\s*:\s*["\']' + re.escape(value) + r'["\']',  # Any key-value pair
-        ]
-        
-        for pattern in object_patterns:
-            if re.search(pattern, line, re.IGNORECASE):
-                return True, "high"
-        
-        # 7. Check if it's in a URL parameter (high confidence)
-        if re.search(r'[?&](?:token|key|secret|auth|apikey|access[_-]?token)=["\']?' + re.escape(value), line_lower):
-            return True, "high"
-        
-        # 8. Check if it's in a function call or string (medium confidence)
-        if re.search(r'\w+\([^)]*["\']' + re.escape(value) + r'["\']', line):
-            return True, "medium"
-        
-        # 9. Check if it's in a comment (medium confidence)
-        if line_lower.strip().startswith('//') or '/*' in line_lower:
-            # But check if it's a TODO/FIXME comment with a secret
-            if any(word in line_lower for word in ['todo', 'fixme', 'note:', 'warning:', 'important:']):
-                return True, "medium"
-        
-        # 10. Type-specific validation
-        if "JWT" in secret_type:
-            if self.validate_jwt(value):
-                return True, "high"
-            else:
-                return False, "invalid_jwt"
-        
-        if "Base64" in secret_type or len(value) > 30:
-            if self.validate_base64(value):
-                return True, "medium"
-            else:
-                return False, "invalid_base64"
-        
-        if "Hex" in secret_type:
-            if self.validate_hex(value):
-                return True, "medium"
-            else:
-                return False, "invalid_hex"
-        
-        # 11. Check for common secret-like patterns
-        secret_patterns = [
-            r'^[A-Za-z0-9+/]{40,}=*$',  # Long base64
-            r'^[a-fA-F0-9]{32,}$',  # Long hex
-            r'^[A-Z]{2}_[a-zA-Z0-9_]+$',  # Like SK_xxx, AC_xxx
-            r'^[a-z]+_[a-z]+_[a-zA-Z0-9_]+$',  # Like sk_live_xxx
-        ]
-        
-        for pattern in secret_patterns:
-            if re.match(pattern, value):
-                return True, "medium"
-        
-        # Default to low confidence if we got this far
-        return True, "low"
-
-    def get_intelligent_context(self, line: str, match_start: int, match_end: int, is_minified: bool) -> str:
-        """Get smart context around a match"""
-        if is_minified:
-            # For minified, show more context
-            context_size = 200
-        else:
-            # For normal files, less context
-            context_size = 100
-        
-        # Calculate bounds
-        line_len = len(line)
-        start = max(0, match_start - context_size)
-        end = min(line_len, match_end + context_size)
-        
-        # Extract context
-        context = line[start:end]
-        
-        # Try to start at a word boundary
-        while start > 0 and context[0] not in (' ', '\t', '\n', ';', '=', ':', '{', '}', '(', ')', ','):
-            start -= 1
-            context = line[start:end]
-        
-        # Add ellipsis if we truncated
-        if start > 0:
-            context = "..." + context
-        if end < line_len:
-            context = context + "..."
-        
-        # Clean up
-        context = re.sub(r'\s+', ' ', context).strip()
-        context = context.replace('\n', ' ')
-        context = context.replace('\t', ' ')
-        
-        return context
-
+    
+    def extract_strings_from_line(self, line: str) -> List[Tuple[str, str]]:
+        """Optimization #12: Extract once, use multiple times"""
+        strings = []
+        for match in re.finditer(r'(["\'])([^\1]*?)\1', line):
+            value = match.group(2)
+            if len(value) >= self.config.min_secret_length:
+                strings.append((value, line))
+        for match in re.finditer(r'`([^`]*?)`', line):
+            value = match.group(1)
+            if len(value) >= self.config.min_secret_length:
+                strings.append((value, line))
+        return strings
+    
     def scan_line(self, line: str, line_num: int, file_path: str, is_minified: bool) -> List[SecretFinding]:
-        """Scan a single line for secrets"""
+        """Scan single line with all methods"""
         findings = []
+        seen_this_line: set = set()  # Bug #2 fix: deduplication within line
+        
+        # Optimization #12: Extract strings once
+        extracted_strings = self.extract_strings_from_line(line)
+        
+        # Aggressive mode: lower thresholds and scan all strings including short ones
+        entropy_threshold = self.config.entropy_threshold
+        score_threshold = self.config.score_threshold
+        min_length = self.config.min_secret_length
+        if self.config.aggressive_mode:
+            entropy_threshold = max(3.5, entropy_threshold - 0.8)
+            score_threshold = max(2.0, score_threshold - 2.0)
+            min_length = max(8, min_length - 8)
+        
+        # 1. Pattern detection
+        # Check if this line is a comment (lowers confidence for secrets in comments)
+        stripped = line.strip()
+        in_comment = stripped.startswith('//') or stripped.startswith('*') or stripped.startswith('/*')
         
         for secret_type, pattern in self.compiled_patterns.items():
             for match in pattern.finditer(line):
-                # Extract the value
-                groups = match.groups()
-                if groups and groups[0]:
-                    value = groups[0]
+                value = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group(0)
+                context = line.strip()[:200]
+                
+                if self.is_false_positive(value, secret_type, context):
+                    with self._lock:
+                        self.metrics.false_positives_filtered += 1
+                    continue
+                
+                is_high_conf = secret_type in self.high_confidence_patterns
+                # Secrets found in comments get lower confidence and severity
+                if in_comment:
+                    confidence = "low"
+                    is_high_conf = False
                 else:
-                    value = match.group(0)
+                    confidence = "high" if is_high_conf else "medium"
+                entropy = EntropyAnalyzer.calculate_shannon_entropy(value)
                 
-                # Skip very short values (except for specific types)
-                if len(value) < 8 and "JWT" not in secret_type:
+                score_obj = SecretScorer.score_secret(value, context, file_path, secret_type, 
+                                                      is_high_conf, self.ml_classifier) if self.config.enable_scoring else None
+                score_value = score_obj.total_score if score_obj else 0.0
+                
+                if self.config.enable_scoring and score_value < score_threshold and not is_high_conf:
                     continue
                 
-                # Analyze context
-                is_valid, confidence = self.analyze_context(line, value, secret_type)
-                
-                if not is_valid:
-                    continue
-                
-                # Get context for display
-                context = self.get_intelligent_context(line, match.start(), match.end(), is_minified)
-                
-                # Create finding
                 finding = SecretFinding(
-                    secret_type=secret_type,
-                    value=value,
-                    context=context,
-                    line_num=line_num,
-                    confidence=confidence,
-                    file_path=file_path,
-                    is_minified=is_minified
+                    secret_type=secret_type, value=value, context=context, line_num=line_num,
+                    confidence=confidence, file_path=file_path, is_minified=is_minified,
+                    entropy=entropy, score=score_value, 
+                    score_breakdown=asdict(score_obj) if score_obj else None,
+                    detection_method="pattern"
                 )
-                
+                # Bug #2 fix: skip if same value already found on this line
+                dedup_key = (line_num, value[:60])
+                if dedup_key in seen_this_line:
+                    continue
+                seen_this_line.add(dedup_key)
                 findings.append(finding)
                 
-                # Update statistics
-                if confidence == "high":
-                    self.stats['findings_high'] += 1
-                elif confidence == "medium":
-                    self.stats['findings_medium'] += 1
-                else:
-                    self.stats['findings_low'] += 1
+                with self._lock:
+                    self.metrics.findings_total += 1
+                    self.metrics.findings_by_confidence[confidence] += 1
+                    self.metrics.findings_by_severity[finding.severity] += 1
+                    self.metrics.findings_by_method['pattern'] += 1
+        
+        # 2. Entropy detection (Enhancement #2)
+        if self.config.enable_entropy_scan:
+            for value, context in extracted_strings:
+                if EntropyAnalyzer.is_high_entropy_secret(value, min_length, entropy_threshold):
+                    if self.is_false_positive(value, "High Entropy", context):
+                        continue
+                    
+                    score_obj = SecretScorer.score_secret(value, context, file_path, None, False, self.ml_classifier)
+                    if score_obj.total_score < score_threshold:
+                        continue
+                    
+                    # Bug fix: entropy findings in comments get low confidence
+                    entropy_confidence = "low" if in_comment else "medium"
+                    
+                    finding = SecretFinding(
+                        secret_type="High Entropy Secret", value=value, context=context[:200],
+                        line_num=line_num, confidence=entropy_confidence, file_path=file_path,
+                        is_minified=is_minified, entropy=EntropyAnalyzer.calculate_shannon_entropy(value),
+                        score=score_obj.total_score, score_breakdown=asdict(score_obj),
+                        detection_method="entropy"
+                    )
+                    # Bug #2 fix: skip if same value already caught by pattern on this line
+                    dedup_key = (line_num, value[:60])
+                    if dedup_key in seen_this_line:
+                        continue
+                    seen_this_line.add(dedup_key)
+                    findings.append(finding)
+                    
+                    with self._lock:
+                        self.metrics.findings_total += 1
+                        self.metrics.findings_by_severity[finding.severity] += 1
+                        self.metrics.findings_by_method['entropy'] += 1
+        
+        # 3. Decode and rescan (Enhancement #3)
+        if self.config.enable_decode_rescan:
+            for value, context in extracted_strings:
+                if SecretDecoder.is_base64(value) or SecretDecoder.is_hex(value):
+                    for decoded in SecretDecoder.decode_and_extract(value)[1:]:
+                        for secret_type, pattern in self.compiled_patterns.items():
+                            match = pattern.search(decoded)
+                            if match:
+                                decoded_value = match.group(1) if match.lastindex else match.group(0)
+                                if self.is_false_positive(decoded_value, secret_type, decoded):
+                                    continue
+                                
+                                # Bug #3 fix: score decoded findings properly
+                                score_obj = SecretScorer.score_secret(
+                                    decoded_value, decoded, file_path, secret_type, True, self.ml_classifier
+                                ) if self.config.enable_scoring else None
+                                score_value = score_obj.total_score if score_obj else 0.0
+                                
+                                finding = SecretFinding(
+                                    secret_type=f"{secret_type} (Decoded)", value=decoded_value,
+                                    context=f"From: {value[:50]}...", line_num=line_num,
+                                    confidence="high", file_path=file_path, is_minified=is_minified,
+                                    detection_method="decoded", decoded_from=value[:100],
+                                    score=score_value,
+                                    score_breakdown=asdict(score_obj) if score_obj else None
+                                )
+                                findings.append(finding)
+                                
+                                with self._lock:
+                                    self.metrics.findings_total += 1
+                                    self.metrics.findings_by_severity[finding.severity] += 1
+                                    self.metrics.secrets_decoded += 1
+                                    self.metrics.findings_by_method['decoded'] += 1
         
         return findings
-
+    
     def scan_file(self, file_path: str) -> List[SecretFinding]:
-        """Scan a file for secrets"""
+        """Scan single file"""
         findings = []
         
         try:
-            # Check file size
-            file_size = os.path.getsize(file_path)
-            if file_size > 100 * 1024 * 1024:  # 100MB
-                print(f"  ⚠️  Large file ({file_size:,} bytes), sampling: {os.path.basename(file_path)}")
-                # Sample the file
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read(5 * 1024 * 1024)  # First 5MB
-            elif file_size == 0:
+            file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+            if file_size_mb > self.config.max_file_size_mb:
+                with self._lock:
+                    self.metrics.files_skipped += 1
                 return findings
-            else:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    content = f.read()
-        except Exception as e:
-            print(f"  ❌ Error reading {file_path}: {str(e)}")
-            return findings
-        
-        # Check if minified
-        is_minified = self.is_minified_file(content, file_path)
-        
-        if is_minified:
-            self.stats['minified_files'] += 1
-            # For minified files, scan as single line
-            findings.extend(self.scan_line(content, 1, file_path, True))
-        else:
-            # For normal files, scan line by line
+            
+            # Cache check (Enhancement #8)
+            if self.file_cache and not self.file_cache.should_scan(file_path):
+                with self._lock:
+                    self.metrics.files_cached += 1
+                return findings
+            
+            is_minified = '.min.' in file_path
+            if is_minified and not self.config.scan_minified:
+                with self._lock:
+                    self.metrics.files_skipped += 1
+                return findings
+            
+            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
             lines = content.split('\n')
+            
+            with self._lock:
+                self.metrics.files_scanned += 1
+                self.metrics.lines_scanned += len(lines)
+            
+            # AST extraction (Enhancement #1)
+            if self.ast_extractor and self.ast_extractor.enabled:
+                try:
+                    for value, context, ast_line in self.ast_extractor.extract_from_code(content):
+                        for secret_type, pattern in self.compiled_patterns.items():
+                            match = pattern.search(value)
+                            if match:
+                                matched_value = match.group(1) if match.lastindex else match.group(0)
+                                if not self.is_false_positive(matched_value, secret_type, context):
+                                    finding = SecretFinding(
+                                        secret_type=f"{secret_type} (AST)", value=matched_value,
+                                        context=context, line_num=ast_line, confidence="high",
+                                        file_path=file_path, detection_method="ast"
+                                    )
+                                    findings.append(finding)
+                                    with self._lock:
+                                        self.metrics.findings_total += 1
+                                        self.metrics.findings_by_severity[finding.severity] += 1
+                                        self.metrics.ast_secrets_found += 1
+                                        self.metrics.findings_by_method['ast'] += 1
+                except:
+                    pass
+            
+            # Line-by-line scan
             for line_num, line in enumerate(lines, 1):
-                # Skip comment-only lines (but still scan them for secrets in comments)
-                stripped = line.strip()
-                if stripped.startswith('//') or stripped.startswith('/*') or stripped.startswith('*'):
-                    # Still scan comments for secrets
-                    findings.extend(self.scan_line(line, line_num, file_path, False))
-                    continue
-                
-                findings.extend(self.scan_line(line, line_num, file_path, False))
+                findings.extend(self.scan_line(line, line_num, file_path, is_minified))
+            
+            if self.file_cache:
+                self.file_cache.update(file_path)
         
-        self.stats['files_scanned'] += 1
+        except Exception as e:
+            self.logger.error(f"Error scanning {file_path}: {e}")
+            with self._lock:
+                self.metrics.errors += 1
+        
         return findings
-
-    def scan_directory(self, directory: str) -> Dict[str, List[SecretFinding]]:
-        """Scan a directory recursively"""
+    
+    def scan_directory(self, target_dir: str) -> Dict[str, List[SecretFinding]]:
+        """Scan directory with process/thread pool (Enhancement #5)"""
+        self.logger.info(f"Scanning: {target_dir}")
         results = {}
         
-        print(f"🔍 JSScan Pro - Scanning: {directory}")
-        print("=" * 60)
-        
-        # Find all JavaScript files
         target_files = []
-        for root, _, files in os.walk(directory):
-            # Skip unnecessary directories
-            skip_dirs = ['.git', 'node_modules', '__pycache__', '.idea', '.vscode', 'dist', 'build']
-            if any(skip_dir in root for skip_dir in skip_dirs):
-                continue
-            
+        extensions = self.config.included_extensions
+        if self.config.aggressive_mode:
+            extensions = extensions + ['.env', '.cfg', '.conf', '.config', '.yaml', '.yml',
+                                       '.xml', '.properties', '.ini', '.sh', '.bash', '.py', '.rb', '.php']
+        for root, dirs, files in os.walk(target_dir):
+            dirs[:] = [d for d in dirs if d not in self.config.excluded_dirs]
             for file in files:
                 ext = os.path.splitext(file)[1].lower()
-                if ext in self.scannable_extensions:
-                    full_path = os.path.join(root, file)
-                    target_files.append(full_path)
-                elif file.endswith('.min.js') or file.endswith('.min.js.map'):
-                    full_path = os.path.join(root, file)
-                    target_files.append(full_path)
+                if ext in extensions:
+                    target_files.append(os.path.join(root, file))
         
-        print(f"📁 Found {len(target_files)} files to scan")
+        self.logger.info(f"Found {len(target_files)} files")
         
-        if not target_files:
-            print("❌ No JavaScript files found to scan")
-            return results
+        # Choose executor (Enhancement #5)
+        if self.config.use_process_pool and len(target_files) > 10:
+            executor_class = ProcessPoolExecutor
+            max_workers = min(self.config.max_workers, multiprocessing.cpu_count())
+        else:
+            executor_class = ThreadPoolExecutor
+            max_workers = self.config.max_workers
         
-        # Scan files
-        for i, file_path in enumerate(target_files):
-            if i % 50 == 0 and i > 0:
-                print(f"   Scanned {i}/{len(target_files)} files...")
+        with executor_class(max_workers=max_workers) as executor:
+            future_to_file = {executor.submit(self.scan_file, fp): fp for fp in target_files}
             
-            findings = self.scan_file(file_path)
-            if findings:
-                results[file_path] = findings
+            if HAS_TQDM:
+                with tqdm(total=len(target_files), desc="Scanning", unit="file") as pbar:
+                    for future in as_completed(future_to_file):
+                        try:
+                            findings = future.result()
+                            if findings:
+                                results[future_to_file[future]] = findings
+                        except Exception as e:
+                            self.logger.error(f"Error: {e}")
+                        pbar.update(1)
+            else:
+                for future in as_completed(future_to_file):
+                    try:
+                        findings = future.result()
+                        if findings:
+                            results[future_to_file[future]] = findings
+                    except Exception as e:
+                        self.logger.error(f"Error: {e}")
         
+        self.metrics.end_time = time.time()
+        if self.file_cache:
+            self.file_cache.save()
         return results
-
-    def print_results(self, results: Dict[str, List[SecretFinding]], target_dir: str):
-        """Print results in a clean, organized format"""
-        if not results:
-            print("\n" + "=" * 60)
-            print("✅ No secrets found!")
-            print("=" * 60)
-            return
-        
-        # Flatten all findings
-        all_findings = []
-        for file_findings in results.values():
-            all_findings.extend(file_findings)
-        
-        # Group by confidence
-        high_conf = [f for f in all_findings if f.confidence == "high"]
-        medium_conf = [f for f in all_findings if f.confidence == "medium"]
-        low_conf = [f for f in all_findings if f.confidence == "low"]
-        
-        print("\n" + "=" * 60)
-        print("📊 SCAN RESULTS")
-        print("=" * 60)
-        print(f"📁 Files scanned: {self.stats['files_scanned']}")
-        print(f"⚡ Minified files: {self.stats['minified_files']}")
-        print(f"🚫 False positives filtered: {self.stats['false_positives_filtered']}")
-        print(f"🔍 Total findings: {len(all_findings)}")
-        print(f"   🔥 High confidence: {len(high_conf)}")
-        print(f"   ⚠️  Medium confidence: {len(medium_conf)}")
-        print(f"   ℹ️  Low confidence: {len(low_conf)}")
-        print("=" * 60)
-        
-        # Print findings by confidence
-        if high_conf:
-            print("\n🔥 HIGH CONFIDENCE FINDINGS (Most likely real secrets):")
-            print("-" * 60)
-            self._print_findings_group(high_conf, target_dir)
-        
-        if medium_conf:
-            print("\n⚠️  MEDIUM CONFIDENCE FINDINGS (Worth investigating):")
-            print("-" * 60)
-            self._print_findings_group(medium_conf, target_dir)
-        
-        if low_conf:
-            print("\nℹ️  LOW CONFIDENCE FINDINGS (Likely false positives):")
-            print("-" * 60)
-            self._print_findings_group(low_conf, target_dir)
-        
-        # Print summary
-        print("\n" + "=" * 60)
-        print("💡 RECOMMENDATIONS:")
-        print("-" * 60)
-        
-        if high_conf:
-            print("1. 🔥 HIGH confidence findings should be investigated IMMEDIATELY")
-            print("   These are very likely real secrets that could be exploited")
-        
-        if medium_conf:
-            print("2. ⚠️  MEDIUM confidence findings should be validated manually")
-            print("   Check the context to see if they're real secrets")
-        
-        print(f"3. 🚫 {self.stats['false_positives_filtered']} false positives were automatically filtered")
-        print("4. 📝 Always verify findings manually before reporting")
-        print("=" * 60)
-
-    def _print_findings_group(self, findings: List[SecretFinding], target_dir: str):
-        """Print a group of findings"""
-        # Group by file
-        by_file = {}
-        for finding in findings:
-            rel_path = os.path.relpath(finding.file_path, target_dir)
-            if rel_path not in by_file:
-                by_file[rel_path] = []
-            by_file[rel_path].append(finding)
-        
-        # Print each file
-        for file_path, file_findings in sorted(by_file.items()):
-            print(f"\n📄 File: {file_path}")
-            if file_findings and file_findings[0].is_minified:
-                print("   (Minified file)")
-            
-            for finding in file_findings:
-                confidence_symbol = "🔥" if finding.confidence == "high" else "⚠️" if finding.confidence == "medium" else "ℹ️"
-                print(f"   {confidence_symbol} Line {finding.line_num}: [{finding.secret_type}]")
-                print(f"      Context: {finding.context}")
-                
-                # Show value (truncated if long)
-                if len(finding.value) > 50:
-                    print(f"      Value: {finding.value[:50]}... (truncated, {len(finding.value)} chars)")
-                else:
-                    print(f"      Value: {finding.value}")
-
-    def export_results(self, results: Dict[str, List[SecretFinding]], output_file: str):
-        """Export results to JSON file"""
-        export_data = {
-            'scan_summary': {
-                'files_scanned': self.stats['files_scanned'],
-                'minified_files': self.stats['minified_files'],
-                'false_positives_filtered': self.stats['false_positives_filtered'],
-                'total_findings': sum(len(v) for v in results.values()),
+    
+    def generate_report_json(self, results: Dict[str, List[SecretFinding]], output_path: str, scan_id: str):
+        report = {
+            'scan_metadata': {
+                'scan_id': scan_id,
+                'tool': 'JSScan Advanced v5.0',
+                'timestamp': datetime.now().isoformat(),
+                'duration': self.metrics.duration(),
             },
-            'findings': []
+            'metrics': self.metrics.to_dict(),
+            'findings': [f.to_dict() for findings in results.values() for f in findings]
         }
-        
-        for file_path, findings in results.items():
-            for finding in findings:
-                export_data['findings'].append({
-                    'file': file_path,
-                    'type': finding.secret_type,
-                    'value': finding.value,
-                    'context': finding.context,
-                    'line': finding.line_num,
-                    'confidence': finding.confidence,
-                    'is_minified': finding.is_minified,
-                })
-        
-        with open(output_file, 'w') as f:
-            json.dump(export_data, f, indent=2)
-        
-        print(f"\n💾 Results exported to: {output_file}")
+        with open(output_path, 'w') as f:
+            json.dump(report, f, indent=2)
+        self.logger.info(f"JSON report: {output_path}")
+    
+    def generate_report_sarif(self, results: Dict[str, List[SecretFinding]], output_path: str, scan_id: str):
+        """SARIF export (Enhancement #7)"""
+        sarif = SARIFExporter.generate_sarif(results, scan_id, self.metrics)
+        with open(output_path, 'w') as f:
+            json.dump(sarif, f, indent=2)
+        self.logger.info(f"SARIF report: {output_path}")
+    
+    def generate_report_html(self, results: Dict[str, List[SecretFinding]], output_path: str, scan_id: str):
+        """HTML export - Beautiful visual report"""
+        html = HTMLExporter.generate_html(results, scan_id, self.metrics)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(html)
+        self.logger.info(f"HTML report: {output_path}")
 
+    def generate_report_text(self, results: Dict[str, List[SecretFinding]], output_path: str, scan_id: str):
+        """Plain text export - readable in terminal or any editor"""
+        lines = []
+        sep = "=" * 80
+        thin = "-" * 80
+
+        lines.append(sep)
+        lines.append("  JSSSCAN ADVANCED v5.0 - ENTERPRISE SECURITY SCAN REPORT")
+        lines.append(sep)
+        lines.append(f"  Scan ID   : {scan_id}")
+        lines.append(f"  Timestamp : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        lines.append(f"  Duration  : {self.metrics.duration():.2f}s")
+        lines.append(f"  Tool      : JSScan Advanced v5.0 Enterprise Edition")
+        lines.append(sep)
+
+        lines.append("")
+        lines.append("SCAN METRICS")
+        lines.append(thin)
+        lines.append(f"  Files Scanned   : {self.metrics.files_scanned}")
+        lines.append(f"  Files Cached    : {self.metrics.files_cached}")
+        lines.append(f"  Files Skipped   : {self.metrics.files_skipped}")
+        lines.append(f"  Lines Analyzed  : {self.metrics.lines_scanned:,}")
+        lines.append(f"  Errors          : {self.metrics.errors}")
+        lines.append("")
+
+        lines.append("FINDINGS SUMMARY")
+        lines.append(thin)
+        lines.append(f"  Total Findings  : {self.metrics.findings_total}")
+        lines.append(f"  [CRITICAL]      : {self.metrics.findings_by_severity['critical']}")
+        lines.append(f"  [HIGH]          : {self.metrics.findings_by_severity['high']}")
+        lines.append(f"  [MEDIUM]        : {self.metrics.findings_by_severity['medium']}")
+        lines.append(f"  [LOW]           : {self.metrics.findings_by_severity['low']}")
+        lines.append("")
+
+        lines.append("DETECTION METHODS")
+        lines.append(thin)
+        lines.append(f"  Pattern Match   : {self.metrics.findings_by_method['pattern']}")
+        lines.append(f"  Entropy         : {self.metrics.findings_by_method['entropy']}")
+        lines.append(f"  Decoded         : {self.metrics.findings_by_method['decoded']}")
+        lines.append(f"  AST             : {self.metrics.findings_by_method['ast']}")
+        lines.append(f"  FP Filtered     : {self.metrics.false_positives_filtered}")
+        lines.append(f"  Context Filtered: {self.metrics.context_filtered}")
+        lines.append("")
+
+        # Group by severity order
+        severity_order = ['critical', 'high', 'medium', 'low']
+        severity_label = {'critical': '[CRITICAL]', 'high': '[HIGH]   ', 'medium': '[MEDIUM] ', 'low': '[LOW]    '}
+
+        for severity in severity_order:
+            sev_findings = [(fp, f) for fp, findings in results.items()
+                           for f in findings if f.severity == severity]
+            if not sev_findings:
+                continue
+
+            lines.append(sep)
+            lines.append(f"  {severity.upper()} SEVERITY FINDINGS ({len(sev_findings)})")
+            lines.append(sep)
+
+            for idx, (file_path, f) in enumerate(sev_findings, 1):
+                lines.append("")
+                lines.append(f"  [{idx}] {severity_label[severity]} {f.secret_type}")
+                lines.append(thin)
+                lines.append(f"  File       : {file_path}")
+                lines.append(f"  Line       : {f.line_num}")
+                lines.append(f"  Method     : {f.detection_method.upper()}")
+                lines.append(f"  Confidence : {f.confidence}")
+                lines.append(f"  Entropy    : {f.entropy:.2f}")
+                lines.append(f"  Score      : {f.score:.2f}")
+                lines.append(f"  CWE        : {f.cwe_id}")
+                lines.append(f"  Finding ID : {f.finding_id}")
+                secret_display = f.value[:80] + ('...' if len(f.value) > 80 else '')
+                lines.append(f"  Secret     : {secret_display}")
+                context_display = f.context[:80] + ('...' if len(f.context) > 80 else '')
+                lines.append(f"  Context    : {context_display}")
+                if f.decoded_from:
+                    lines.append(f"  Decoded    : {f.decoded_from[:60]}...")
+                lines.append(f"  Remediation: Rotate secret immediately. Use env vars or secrets manager.")
+
+        lines.append("")
+        lines.append(sep)
+        lines.append("  END OF REPORT")
+        lines.append(sep)
+
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write('\n'.join(lines))
+        self.logger.info(f"Text report: {output_path}")
+    
+    def print_summary(self, results: Dict[str, List[SecretFinding]]):
+        print("\n" + "="*80)
+        print("📊 JSSSCAN ADVANCED v5.0 - ENTERPRISE SCAN SUMMARY")
+        print("="*80)
+        print(f"⏱️  Duration: {self.metrics.duration():.2f}s")
+        print(f"📁 Files Scanned: {self.metrics.files_scanned} (Cached: {self.metrics.files_cached})")
+        print(f"📝 Lines: {self.metrics.lines_scanned:,}")
+        print(f"⚠️  Findings: {self.metrics.findings_total}")
+        print(f"   🔥 Critical: {self.metrics.findings_by_severity['critical']}")
+        print(f"   🔴 High: {self.metrics.findings_by_severity['high']}")
+        print(f"   🟡 Medium: {self.metrics.findings_by_severity['medium']}")
+        print(f"   🟢 Low: {self.metrics.findings_by_severity['low']}")
+        print(f"\n🔍 Detection Methods:")
+        print(f"   📋 Pattern: {self.metrics.findings_by_method['pattern']}")
+        print(f"   🎲 Entropy: {self.metrics.findings_by_method['entropy']}")
+        print(f"   🔓 Decoded: {self.metrics.findings_by_method['decoded']}")
+        print(f"   🌳 AST: {self.metrics.findings_by_method['ast']}")
+        print(f"🚫 False Positives Filtered: {self.metrics.false_positives_filtered}")
+        print(f"🧹 Context Filtered: {self.metrics.context_filtered}")
+        print("="*80)
+
+# ==================== CLI INTERFACE ====================
 
 def main():
-    """Main entry point"""
-    import argparse
+    """Main entry point with full CLI (Enhancement #11)"""
+    parser = argparse.ArgumentParser(
+        description='JSScan Advanced v5.0 - Enterprise JavaScript Secret Scanner',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog='''
+Examples:
+  # Basic scan
+  python jssscan_v5.py /path/to/code
+  
+  # Full featured
+  python jssscan_v5.py /code --ast --ml --ml-model model.pkl --formats json sarif
+  
+  # Custom patterns
+  python jssscan_v5.py /code --custom-patterns patterns.json
+  
+  # High performance
+  python jssscan_v5.py /code --workers 16 --cache
+        '''
+    )
     
-    parser = argparse.ArgumentParser(description='JSScan Pro - Advanced JavaScript Secret Scanner')
-    parser.add_argument('directory', help='Directory to scan')
+    parser.add_argument('target', help='File or directory to scan')
     parser.add_argument('-a', '--aggressive', action='store_true', 
-                       help='Use aggressive mode (more patterns, more false positives)')
-    parser.add_argument('-o', '--output', help='Export results to JSON file')
-    parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
+                       help='Aggressive mode: lower entropy threshold, lower score threshold, scan more file types')
+    parser.add_argument('-w', '--workers', type=int, default=4, help='Worker threads (default: 4)')
+    
+    # Advanced features
+    parser.add_argument('--entropy', action='store_true', default=True, help='Enable entropy detection')
+    parser.add_argument('--no-entropy', dest='entropy', action='store_false')
+    parser.add_argument('--entropy-threshold', type=float, default=4.5)
+    
+    parser.add_argument('--decode', action='store_true', default=True, help='Enable decoding')
+    parser.add_argument('--no-decode', dest='decode', action='store_false')
+    
+    parser.add_argument('--scoring', action='store_true', default=True, help='Enable scoring')
+    parser.add_argument('--no-scoring', dest='scoring', action='store_false')
+    parser.add_argument('--score-threshold', type=float, default=5.0)
+    
+    parser.add_argument('--cache', action='store_true', default=False, help='Enable cache')
+    parser.add_argument('--no-cache', dest='cache', action='store_false')
+    
+    # v5.0 features
+    parser.add_argument('--ast', action='store_true', default=True, help='Enable AST parsing (Enhancement #1)')
+    parser.add_argument('--no-ast', dest='ast', action='store_false')
+    
+    parser.add_argument('--ml', dest='ml_classifier', action='store_true', help='Enable ML (Enhancement #4)')
+    parser.add_argument('--ml-model', dest='ml_model_path', help='ML model path')
+    
+    parser.add_argument('--custom-patterns', dest='custom_patterns_file', help='Custom patterns file (Enhancement #6)')
+    
+    parser.add_argument('--use-threads', action='store_true', help='Use threads instead of processes')
+    
+    parser.add_argument('--context-filter', action='store_true', default=True, help='Context filter (Enhancement #9)')
+    parser.add_argument('--no-context-filter', dest='context_filter', action='store_false')
+    
+    # Standard options
+    parser.add_argument('--formats', nargs='+', choices=['json', 'sarif', 'html', 'text'], default=['json'], 
+                       help='Output formats: json, sarif, html, text (Enhancement #7)')
+    parser.add_argument('-o', '--output-dir', default='reports', help='Output directory')
+    parser.add_argument('--log-level', default='INFO', choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                       help='Logging verbosity level (default: INFO)')
+    parser.add_argument('--max-file-size', type=int, default=10, help='Max file size in MB')
+    parser.add_argument('--no-minified', action='store_true', help='Skip minified files')
     
     args = parser.parse_args()
     
-    if not os.path.isdir(args.directory):
-        print(f"❌ Error: {args.directory} is not a valid directory")
+    if not os.path.exists(args.target):
+        print(f"❌ Error: {args.target} does not exist")
         sys.exit(1)
     
-    # Create scanner
-    scanner = JSScanPro(aggressive_mode=args.aggressive)
+    is_file = os.path.isfile(args.target)
     
-    # Scan directory
-    results = scanner.scan_directory(args.directory)
+    config = ScanConfig(
+        aggressive_mode=args.aggressive,
+        max_workers=args.workers,
+        max_file_size_mb=args.max_file_size,
+        scan_minified=not args.no_minified,
+        log_level=args.log_level,
+        export_formats=args.formats,
+        enable_entropy_scan=args.entropy,
+        entropy_threshold=args.entropy_threshold,
+        enable_decode_rescan=args.decode,
+        enable_scoring=args.scoring,
+        score_threshold=args.score_threshold,
+        enable_file_cache=args.cache,
+        enable_ast_parsing=args.ast,
+        enable_ml_classifier=args.ml_classifier,
+        ml_model_path=args.ml_model_path,
+        custom_patterns_file=args.custom_patterns_file,
+        use_process_pool=not args.use_threads,
+        enable_context_filter=args.context_filter,
+    )
     
-    # Print results
-    scanner.print_results(results, args.directory)
+    os.makedirs(args.output_dir, exist_ok=True)
     
-    # Export if requested
-    if args.output:
-        scanner.export_results(results, args.output)
+    print("🚀 JSScan Advanced v5.0 - Enterprise Edition")
+    print(f"Features: AST={config.enable_ast_parsing}, ML={config.enable_ml_classifier}, "
+          f"Context={config.enable_context_filter}, Processes={config.use_process_pool}")
+    
+    scanner = JSScanAdvanced(config)
+    scan_id = datetime.now().strftime('%Y%m%d_%H%M%S')
+    
+    # Run scan
+    if is_file:
+        print(f"\n🔍 Scanning file: {args.target}")
+        file_findings = scanner.scan_file(args.target)
+        results = {args.target: file_findings} if file_findings else {}
+        scanner.metrics.end_time = time.time()
+    else:
+        results = scanner.scan_directory(args.target)
+    
+    scanner.print_summary(results)
+    
+    print(f"\n📄 Generating reports...")
+    
+    if 'json' in args.formats:
+        json_path = os.path.join(args.output_dir, f'scan_{scan_id}.json')
+        scanner.generate_report_json(results, json_path, scan_id)
+    
+    if 'sarif' in args.formats:
+        sarif_path = os.path.join(args.output_dir, f'scan_{scan_id}.sarif')
+        scanner.generate_report_sarif(results, sarif_path, scan_id)
+    
+    if 'html' in args.formats:
+        html_path = os.path.join(args.output_dir, f'scan_{scan_id}.html')
+        scanner.generate_report_html(results, html_path, scan_id)
+    
+    if 'text' in args.formats:
+        text_path = os.path.join(args.output_dir, f'scan_{scan_id}.txt')
+        scanner.generate_report_text(results, text_path, scan_id)
+    
+    print(f"\n✅ Complete! Reports in {args.output_dir}/")
+    
+    if scanner.file_cache:
+        scanner.file_cache.close()
+    
+    # Exit codes
+    critical = scanner.metrics.findings_by_severity['critical']
+    high = scanner.metrics.findings_by_severity['high']
+    
+    if critical > 0:
+        sys.exit(2)
+    elif high > 0:
+        sys.exit(1)
+    else:
+        sys.exit(0)
 
 
 if __name__ == "__main__":
