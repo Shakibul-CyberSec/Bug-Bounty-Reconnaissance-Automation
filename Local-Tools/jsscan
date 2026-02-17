@@ -69,7 +69,14 @@ class EntropyAnalyzer:
     """Analyze string entropy with compression ratio (Enhancement #2)"""
     
     _entropy_cache = {}  # Optimization #12: Cache
-    _cache_lock = threading.Lock()
+    _cache_lock = None  # Will be lazily initialized
+    
+    @staticmethod
+    def _get_lock():
+        """Lazy initialization of lock for pickle compatibility"""
+        if EntropyAnalyzer._cache_lock is None:
+            EntropyAnalyzer._cache_lock = threading.Lock()
+        return EntropyAnalyzer._cache_lock
     
     @staticmethod
     def calculate_shannon_entropy(data: str) -> float:
@@ -78,7 +85,7 @@ class EntropyAnalyzer:
             return 0.0
         
         # Check cache
-        with EntropyAnalyzer._cache_lock:
+        with EntropyAnalyzer._get_lock():
             if data in EntropyAnalyzer._entropy_cache:
                 return EntropyAnalyzer._entropy_cache[data]
         
@@ -89,7 +96,7 @@ class EntropyAnalyzer:
                 entropy -= p_x * math.log2(p_x)
         
         # Cache result (limit size)
-        with EntropyAnalyzer._cache_lock:
+        with EntropyAnalyzer._get_lock():
             if len(EntropyAnalyzer._entropy_cache) < 10000:
                 EntropyAnalyzer._entropy_cache[data] = entropy
         
@@ -148,21 +155,43 @@ class EntropyAnalyzer:
         if len(data) < min_length:
             return False
         
+        # Quick reject: Ethereum/Bitcoin addresses (handled in false positive but double-check)
+        if re.match(r'^0x[0-9a-fA-F]{40}$', data) or re.match(r'^[13bc][a-zA-Z0-9]{25,59}$', data):
+            return False
+        
+        # Quick reject: contains spaces (likely natural language or CSS)
+        if ' ' in data:
+            return False
+        
+        # Quick reject: UUIDs
+        if re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', data):
+            return False
+        
         stats = EntropyAnalyzer.calculate_charset_entropy(data)
         
-        # High entropy + mixed chars + low compression = likely secret
-        if stats['entropy'] >= min_entropy and stats['charset_score'] >= 0.5:
-            if stats['compression_ratio'] > 0.7:  # Poor compression
-                return True
+        # Filter out things that compress well (natural language, repetitive patterns)
+        # Good compression (ratio < 0.5) = likely not a secret
+        if stats['compression_ratio'] < 0.5:
+            return False
         
-        # Very high entropy with poor compression
-        if stats['entropy'] >= 5.0 and len(data) >= 32:
-            if stats['compression_ratio'] > 0.6:
-                return True
-        
-        # Filter repeating patterns (Enhancement #2)
+        # Filter high repetition (same character repeated)
         if stats['repeat_ratio'] > 0.3:
             return False
+        
+        # For entropy detection, require BOTH:
+        # 1. High entropy (randomness)
+        # 2. Poor compression (doesn't compress well)
+        # 3. Mixed character types
+        
+        # High entropy + mixed chars + poor compression = likely secret
+        if stats['entropy'] >= min_entropy and stats['charset_score'] >= 0.5:
+            if stats['compression_ratio'] > 0.65:  # Poor compression
+                return True
+        
+        # Very high entropy with poor compression (more strict)
+        if stats['entropy'] >= 5.2 and len(data) >= 32:
+            if stats['compression_ratio'] > 0.6:
+                return True
         
         return False
 
@@ -329,6 +358,52 @@ class ASTSecretExtractor:
         
         return ''
     
+    def _extract_array_join(self, call_node) -> str:
+        """
+        Extract string from array.join() calls:
+        ['A', 'K', 'I', 'A', '1234'].join('') -> 'AKIA1234'
+        ['part1', 'part2'].join('_') -> 'part1_part2'
+        """
+        if not call_node or self._get_attr(call_node, 'type') != 'CallExpression':
+            return ''
+        
+        callee = self._get_attr(call_node, 'callee')
+        if not callee or self._get_attr(callee, 'type') != 'MemberExpression':
+            return ''
+        
+        # Check if it's .join()
+        prop = self._get_attr(callee, 'property')
+        if not prop or self._get_attr(prop, 'name') != 'join':
+            return ''
+        
+        # Get the array object
+        obj = self._get_attr(callee, 'object')
+        if not obj or self._get_attr(obj, 'type') != 'ArrayExpression':
+            return ''
+        
+        # Get the separator (default '')
+        args = self._get_attr(call_node, 'arguments') or []
+        separator = ''
+        if len(args) > 0 and self._get_attr(args[0], 'type') == 'Literal':
+            sep_val = self._get_attr(args[0], 'value', '')
+            if isinstance(sep_val, str):
+                separator = sep_val
+        
+        # Extract array elements
+        elements = self._get_attr(obj, 'elements') or []
+        parts = []
+        for elem in elements:
+            if elem and self._get_attr(elem, 'type') == 'Literal':
+                val = self._get_attr(elem, 'value', '')
+                if isinstance(val, str):
+                    parts.append(val)
+                elif isinstance(val, (int, float)):
+                    parts.append(str(val))
+        
+        if parts:
+            return separator.join(parts)
+        return ''
+    
     def extract_from_code(self, code: str) -> List[Tuple[str, str, int]]:
         """Returns: List of (value, context, line_number)"""
         if not self.enabled:
@@ -397,6 +472,25 @@ class ASTSecretExtractor:
                     if joined and len(joined) >= 8:
                         line = self._get_line(node)
                         secrets.append((joined, f"var {id_name} = '{joined}'", line))
+                # Handle array.join() patterns: ['A','K','I','A'].join('')
+                elif self._get_attr(init, 'type') == 'CallExpression':
+                    joined = self._extract_array_join(init)
+                    if joined and len(joined) >= 8:
+                        line = self._get_line(node)
+                        secrets.append((joined, f"var {id_name} = '{joined}'", line))
+        
+        # CallExpression: catch array.join() anywhere
+        elif node_type == 'CallExpression':
+            callee = self._get_attr(node, 'callee')
+            if callee and self._get_attr(callee, 'type') == 'MemberExpression':
+                prop = self._get_attr(callee, 'property')
+                if prop and self._get_attr(prop, 'name') == 'join':
+                    joined = self._extract_array_join(node)
+                    if joined and len(joined) >= 16:
+                        line = self._get_line(node)
+                        context = self._get_context(code, line)
+                        secrets.append((joined, context, line))
+                        return  # Don't walk children
         
         # Recursively walk all child nodes using esprima object attributes
         self._walk_children(node, secrets, code)
@@ -497,11 +591,24 @@ class ContextAwareFPFilter:
     
     @staticmethod
     def looks_like_path(value: str) -> bool:
-        if ('/' in value or '\\' in value) and not value.startswith('http'):
-            parts = value.replace('\\', '/').split('/')
-            if len(parts) >= 2:
-                return all(part.replace('.', '').replace('-', '').replace('_', '').isalnum() 
-                          for part in parts if part)
+        # File path patterns
+        if value.count('/') >= 3 or value.count('\\') >= 2:
+            return True
+        # Windows paths: C:\, D:\, \\server\
+        if re.match(r'^[A-Z]:\\', value) or re.match(r'^\\\\', value):
+            return True
+        # Unix absolute paths: /usr/..., /home/...
+        if re.match(r'^/[a-zA-Z0-9]', value):
+            return True
+        # Relative paths with ../
+        if re.match(r'^\.\./.*/', value):
+            return True
+        # Node modules paths
+        if 'node_modules' in value or '/machine/' in value:
+            return True
+        # Common file extensions
+        if any(ext in value for ext in ['.js', '.ts', '.json', '.css', '.html', '.jsx', '.tsx', '.py', '.rb', '.php']):
+            return True
         return False
     
     @staticmethod
@@ -513,28 +620,76 @@ class ContextAwareFPFilter:
     
     @staticmethod
     def looks_like_hash(value: str) -> bool:
+        # Standard hash lengths: MD5(32), SHA1(40), SHA256(64)
         if len(value) in [32, 40, 64] and re.match(r'^[0-9a-fA-F]+$', value):
             return value.islower() or value.isupper()
         return False
     
     @staticmethod
+    def looks_like_uuid(value: str) -> bool:
+        return bool(re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', value))
+    
+    @staticmethod
+    def looks_like_blockchain_address(value: str) -> bool:
+        # Ethereum addresses (0x + 40 hex chars)
+        if re.match(r'^0x[0-9a-fA-F]{40}$', value):
+            return True
+        # Bitcoin addresses
+        if re.match(r'^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$', value):
+            return True
+        if re.match(r'^bc1[a-z0-9]{39,59}$', value):  # Bech32
+            return True
+        return False
+    
+    @staticmethod
     def is_in_comment(context: str) -> bool:
         context = context.strip()
-        return (context.startswith(('//','#')) or 
-               ('/*' in context and '*/' in context))
+        return (context.startswith(('//','#', '/*', '*')) or 
+               ('/*' in context and '*/' in context) or
+               '_comment' in context.lower() or
+               '_block_comment' in context.lower())
     
     @staticmethod
     def should_filter(value: str, context: str, secret_type: str) -> Tuple[bool, Optional[str]]:
-        # Don't filter high-confidence patterns
-        if any(p in secret_type for p in ['GitHub', 'Stripe', 'AWS Access Key', 'Slack Bot']):
+        # Don't filter high-confidence patterns - EXPANDED to include webhooks and connection strings
+        high_confidence_types = [
+            'GitHub', 'Stripe', 'AWS Access Key', 'Slack Bot', 'Slack Webhook', 
+            'SendGrid', 'Mailgun', 'JWT Token', 'Teams Webhook', 'MS Teams', 
+            'Outlook Webhook Legacy',  # Added
+            'Sentry DSN', 'MongoDB', 'PostgreSQL', 'MySQL', 'Redis', 'Cassandra',
+            'Database', 'Connection String'
+        ]
+        if any(p in secret_type for p in high_confidence_types):
             return False, None
         
+        # Also exempt webhook domains even if pattern name doesn't match
+        webhook_domains = ['hooks.slack.com', 'webhook.office.com', 'ingest.sentry.io']
+        if any(domain in value for domain in webhook_domains):
+            return False, None
+        
+        # Blockchain addresses are public, filter
+        if ContextAwareFPFilter.looks_like_blockchain_address(value):
+            return True, "blockchain_address"
+        
+        # File paths - filter
         if ContextAwareFPFilter.looks_like_path(value):
-            return True, "looks_like_path"
+            return True, "file_path"
+        
+        # URLs without credentials - filter (but webhooks already exempt)
         if ContextAwareFPFilter.looks_like_url(value):
             return True, "looks_like_url"
+        
+        # Hash strings - filter unless context suggests secret
         if ContextAwareFPFilter.looks_like_hash(value):
-            return True, "looks_like_hash"
+            secret_keywords = ['auth', 'token', 'secret', 'key', 'password', 'twilio']
+            if not any(kw in context.lower() for kw in secret_keywords):
+                return True, "looks_like_hash"
+        
+        # UUIDs - filter unless context suggests secret (e.g., Azure client ID)
+        if ContextAwareFPFilter.looks_like_uuid(value):
+            secret_keywords = ['client', 'tenant', 'azure', 'id', 'secret', 'key']
+            if not any(kw in context.lower() for kw in secret_keywords):
+                return True, "uuid"
         
         return False, None
 
@@ -607,6 +762,23 @@ class SecretScorer:
                 score.context_score = 2.0
                 break
         
+        # NEGATIVE SCORING: Penalize false positive patterns
+        # Ethereum/blockchain addresses (PUBLIC, not secrets)
+        if re.match(r'^0x[0-9a-fA-F]{40}$', value):
+            score.entropy_score = max(0, score.entropy_score - 5.0)  # Heavy penalty
+        
+        # Contains spaces (likely natural language or CSS)
+        if ' ' in value:
+            score.entropy_score = max(0, score.entropy_score - 3.0)
+        
+        # Good compression (compresses well = likely text)
+        if stats['compression_ratio'] < 0.5:
+            score.entropy_score = max(0, score.entropy_score - 2.0)
+        
+        # UUID pattern (not a secret)
+        if re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', value):
+            score.entropy_score = max(0, score.entropy_score - 4.0)
+        
         # Length (0-1)
         score.length_score = 1.0 if len(value) >= 40 else 0.8 if len(value) >= 32 else 0.5 if len(value) >= 24 else 0
         
@@ -652,6 +824,18 @@ class FileHashCache:
         ''')
         self.conn.execute('CREATE INDEX IF NOT EXISTS idx_file_path ON file_cache(file_path)')
         self.conn.commit()
+    
+    def __getstate__(self):
+        """Exclude SQLite connection from pickle"""
+        state = self.__dict__.copy()
+        state['conn'] = None
+        return state
+    
+    def __setstate__(self, state):
+        """Restore SQLite connection after unpickling"""
+        self.__dict__.update(state)
+        if self.conn is None:
+            self._init_db()
     
     def get_file_hash(self, file_path: str) -> str:
         hasher = hashlib.sha256()
@@ -1223,6 +1407,21 @@ class JSScanAdvanced:
         
         self.logger.info(f"JSScan v5.0 initialized with {len(self.compiled_patterns)} patterns")
     
+    def __getstate__(self):
+        """Exclude unpicklable objects (logger and lock) for multiprocessing"""
+        state = self.__dict__.copy()
+        state['logger'] = None
+        state['_lock'] = None
+        return state
+    
+    def __setstate__(self, state):
+        """Restore unpicklable objects after unpickling"""
+        self.__dict__.update(state)
+        if self.logger is None:
+            self.logger = self._setup_logger()
+        if self._lock is None:
+            self._lock = threading.Lock()
+    
     def _setup_logger(self) -> logging.Logger:
         logger = logging.Logger("jssscan")
         logger.setLevel(getattr(logging, self.config.log_level))
@@ -1245,28 +1444,38 @@ class JSScanAdvanced:
     
     def _init_patterns(self):
         self.high_confidence_patterns = {
-            "Google API Key": r'\bAIza[0-9A-Za-z\-_]{35,40}\b',
+            "Google API Key": r'\bAIza[0-9A-Za-z\-_]{35,50}\b',  # Increased max length to catch test variants
             "AWS Access Key ID": r'\bAKIA[0-9A-Z]{16,}\b',
             "AWS Access Key Config": r'(?i)AWS_ACCESS_KEY_ID["\']?\s*[=:]\s*["\']?(AKIA[0-9A-Z]{16,})["\']?',
-            "AWS Secret Access Key": r'(?i)(?:aws|secret).{0,30}(?:secret|key).{0,30}["\']([A-Za-z0-9/+=]{40,})["\']',
+            "AWS Secret Access Key": r'(?i)(?:aws[_\s]?)?secret[_\s]?(?:access[_\s]?)?key["\']?\s*[=:]\s*["\']?([A-Za-z0-9/+=]{40})["\']?',
+            "AWS AppSync API Key": r'\bda2-[a-z0-9]{26}\b',
             "Stripe Secret Key": r'\bsk_(?:test|live)_[a-zA-Z0-9]{24,}\b',
             "GitHub Personal Access Token": r'\bghp_[A-Za-z0-9]{36,}\b',
             "Slack Bot Token": r'\bxoxb-[0-9]{10,13}-[0-9]{10,13}-[a-zA-Z0-9]{24,}\b',
-            "Slack Webhook URL": r'https://hooks\.slack\.com/services/[A-Za-z0-9]{8,12}/[A-Za-z0-9]{8,12}/[A-Za-z0-9]{24,}',
+            "Slack Webhook URL": r'https://hooks\.slack\.com/services/T[A-Z0-9]{8,10}/B[A-Z0-9]{8,10}/[A-Za-z0-9]{24,}',
+            "Slack Signing Secret": r'\b[a-f0-9]{32}\b(?=.*slack)',
             "SendGrid API Key": r'\bSG\.[a-zA-Z0-9-_]{20,}\.[a-zA-Z0-9-_]{40,}\b',
+            "Mailgun API Key": r'\bkey-[a-z0-9]{32}\b',
+            "Heroku API Key": r'\b[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}\b(?=.*heroku)',
             "JWT Token": r'\beyJ[A-Za-z0-9-_=]+\.[A-Za-z0-9-_=]+\.[A-Za-z0-9-_.+/=]*\b',
-            "MongoDB URL": r'mongodb(?:\+srv)?://[a-zA-Z0-9_]+:[^@\s]+@[^\s"\']+',
-            "PostgreSQL URL": r'postgres(?:ql)?://[a-zA-Z0-9_]+:[^@\s]+@[^\s"\']+',
-            "MySQL URL": r'mysql://[a-zA-Z0-9_]+:[^@\s]+@[^\s"\']+',
-            "Redis URL": r'redis://(?:[^:]*:)?[^@\s]+@[^\s"\']+',
-            "Cassandra URL": r'cassandra://[a-zA-Z0-9_]+:[^@\s]+@[^\s"\']+',
+            "MongoDB URL": r'mongodb(?:\+srv)?://([^:]+):(.+)@([a-zA-Z0-9][^\s"\']*)',
+            "PostgreSQL URL": r'postgres(?:ql)?://([^:]+):(.+)@([a-zA-Z0-9][^\s"\']*)',
+            "MySQL URL": r'mysql://([^:]+):(.+)@([a-zA-Z0-9][^\s"\']*)',
+            "SQL Server Connection String": r'(?i)(?:Server|Data Source)=[^;]+;.*?(?:Password|Pwd)=([^;"\'\s]+)',
+            "Redis URL": r'redis://(?::([^@\s"\']+)@|([^:]+):(.+)@)([a-zA-Z0-9][^\s"\']*)',
+            "Cassandra URL": r'cassandra://([^:]+):(.+)@([a-zA-Z0-9][^\s"\']*)',
             "Twilio Account SID": r'\bAC[0-9a-fA-F]{32}\b',
+            "Twilio Auth Token": r'(?i)(?:twilio|auth)(?:[a-zA-Z0-9_-]*)\s*[=:]\s*["\']([a-f0-9]{32})["\']',
+            "Datadog App Key": r'(?i)(?:datadog)(?:[a-zA-Z0-9_-]*)\s*[=:]\s*["\']([a-zA-Z0-9]{40,})["\']',
+            "New Relic License Key": r'(?i)(?:newrelic|new[_-]?relic)[a-zA-Z0-9_]*\s*[=:]\s*["\']([a-zA-Z0-9]{40})["\']',
+            "Sentry DSN": r'https://[a-f0-9]{32}@[^\s"\']+\.ingest\.sentry\.io/\d+',
             "SSH RSA Private Key": r'-----BEGIN (?:RSA |OPENSSH )?PRIVATE KEY-----',
             "SSH EC Private Key": r'-----BEGIN EC PRIVATE KEY-----',
             "API Key in URL": r'[?&]api[_-]?key=([a-zA-Z0-9_\-]{20,})',
             "Token in URL": r'[?&]token=([a-zA-Z0-9_\-]{20,})',
             "MS Teams Webhook": r'https://[a-zA-Z0-9]+\.webhook\.office\.com/webhookb2/[a-zA-Z0-9\-]+@[a-zA-Z0-9\-]+/IncomingWebhook/[a-zA-Z0-9]+/[a-zA-Z0-9\-]+',
             "Outlook Webhook Legacy": r'https://outlook\.office\.com/webhook/[a-fA-F0-9\-]{36}@[a-fA-F0-9\-]{36}/IncomingWebhook/[a-zA-Z0-9]+/[a-fA-F0-9\-]{36}',
+            "GitHub OAuth Token": r'\bgho_[A-Za-z0-9]{36,}\b',
         }
         
         self.medium_confidence_patterns = {
@@ -1274,13 +1483,11 @@ class JSScanAdvanced:
             "Secret Assignment": r'(?i)(?:secret)\s*[=:]\s*["\']([a-zA-Z0-9_\-=+/]{20,100})["\']',
             "Token Assignment": r'(?i)(?:token)\s*[=:]\s*["\']([a-zA-Z0-9_\-=+/]{20,100})["\']',
             "Password Assignment": r'(?i)(?:password|passwd|pwd)\s*[=:]\s*["\']([^"\']{8,})["\']',
-            "Twilio Auth Token": r'(?i)(?:twilio|auth).{0,30}(?:token|auth)["\']?\s*[=:]\s*["\']([a-fA-F0-9]{32})["\']',
             "Azure Client ID": r'(?i)(?:azure|client).{0,20}(?:id|client_id)["\']?\s*[=:]\s*["\']([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})["\']',
             "Azure Tenant ID": r'(?i)(?:tenant|azure).{0,20}(?:id|tenant_id)["\']?\s*[=:]\s*["\']([a-fA-F0-9]{8}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{4}-[a-fA-F0-9]{12})["\']',
             "Braintree Merchant ID": r'(?i)(?:braintree).{0,20}(?:merchant).{0,20}id["\']?\s*[=:]\s*["\']([a-zA-Z0-9]{20,})["\']',
             "Plaid Client ID": r'(?i)(?:plaid).{0,20}(?:client).{0,20}id["\']?\s*[=:]\s*["\']([a-zA-Z0-9]{20,})["\']',
             "Encryption Key": r'(?i)(?:encryption|encrypt).{0,20}key["\']?\s*[=:]\s*["\']([a-zA-Z0-9_\-=+/]{20,})["\']',
-            "Signing Secret": r'(?i)(?:slack|signing).{0,30}(?:signing|secret).{0,20}["\']?\s*[=:]\s*["\']([a-fA-F0-9]{20,})["\']',
             "Generic Hex Token": r'(?i)(?:token|auth|secret|key).{0,30}["\']?\s*[=:]\s*["\']([a-fA-F0-9]{32,40})["\']',
             "Database Password": r'(?i)(?:database|db).{0,20}(?:password|passwd)["\']?\s*[=:]\s*["\']([^"\']{8,})["\']',
             "Private Key Env": r'(?i)(?:private).{0,20}key["\']?\s*[=:]\s*["\']([^"\']{20,})["\']',
@@ -1295,10 +1502,75 @@ class JSScanAdvanced:
     
     def _init_false_positives(self):
         self.false_positives = {'null', 'undefined', 'true', 'false', 'example', 'test', 
-                               'demo', 'dummy', 'placeholder', 'YOUR_API_KEY_HERE'}
+                               'demo', 'dummy', 'placeholder', 'YOUR_API_KEY_HERE',
+                               'your_api_key', 'your_secret', 'your_token', 'your_password',
+                               'test_api_key', 'test_secret', 'test_token', 'test_password',
+                               'example-secret', 'example_secret', 'demo_token', 'demo_key',
+                               'sample_key', 'sample_token', 'fake_key', 'fake_token',
+                               'mock_key', 'mock_token', 'dummy_key', 'dummy_token'}
     
     def is_false_positive(self, value: str, secret_type: str, context: str = "") -> bool:
+        # UNIVERSAL FILTERS - Apply to ALL secret types
+
+        # Guard against None values from optional regex capture groups
+        if not value:
+            return True
+
+        # Stripe publishable keys are PUBLIC (pk_live_, pk_test_, pk_prod_)
+        if value.startswith(('pk_live_', 'pk_test_', 'pk_prod_', 'pk_')):
+            return True
+        
+        # Braintree public keys (explicitly public)
+        if 'braintree' in context.lower() and 'public' in context.lower():
+            return True
+        
+        # Google Analytics IDs (UA-*, G-*) are NOT secrets
+        if re.match(r'^UA-\d{6,}-\d+$', value) or re.match(r'^G-[A-Z0-9]{10}$', value):
+            return True
+        
+        # Exact match false positives (not substring)
         if value.lower() in self.false_positives:
+            return True
+        
+        # FILTER PUBLIC KEYS - Stripe publishable keys and PayPal client IDs are PUBLIC, not secrets
+        if secret_type in ['High Entropy Secret', 'API Key Assignment', 'Secret Assignment']:
+            # Stripe publishable keys start with pk_live_ or pk_test_
+            if value.startswith(('pk_live_', 'pk_test_', 'pk_prod_')):
+                return True
+            # PayPal client IDs are 80 chars alphanumeric - if context mentions "client" and not "secret"
+            if len(value) == 80 and 'client' in context.lower() and 'secret' not in context.lower():
+                if 'paypal' in context.lower():
+                    return True
+            # Azure client IDs are UUIDs - not secrets
+            if re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', value):
+                if 'client' in context.lower() and 'secret' not in context.lower():
+                    return True
+        
+        # Ethereum addresses are PUBLIC - not secrets (40 hex chars starting with 0x)
+        if re.match(r'^0x[0-9a-fA-F]{40}$', value):
+            return True
+        
+        # Bitcoin addresses are PUBLIC
+        if re.match(r'^[13][a-km-zA-HJ-NP-Z1-9]{25,34}$', value) or re.match(r'^bc1[a-z0-9]{39,59}$', value):
+            return True
+        
+        # CSS class names (contain spaces and common CSS words)
+        if ' ' in value and any(css in value.lower() for css in ['flex', 'grid', 'col', 'row', 'items', 'justify', 'gap', 'p-', 'm-', 'w-', 'h-', 'text-', 'bg-']):
+            return True
+        
+        # Natural language (contains common words and spaces)
+        if ' ' in value and len(value.split()) >= 3:
+            common_words = {'the', 'and', 'for', 'are', 'you', 'your', 'this', 'that', 'with', 'have', 'been', 'will', 'can', 'into', 'we', 've', 'automatically', 'categories', 'from', 'they', 'was', 'not', 'but', 'all', 'their', 'when', 'there', 'what', 'which', 'about'}
+            words = set(value.lower().replace("'", " ").split())
+            if len(words & common_words) >= 2:  # At least 2 common English words
+                return True
+        
+        # Sequential/repetitive patterns (123456, aaaaaa, abcdef)
+        if re.match(r'^(.)\1{10,}$', value):  # Same character repeated 10+ times
+            return True
+        if re.match(r'^(01234|12345|23456|34567|45678|56789){2,}', value):  # Sequential digits
+            return True
+        if re.match(r'^(abcde|bcdef|cdefg|defgh|efghi|fghij){2,}', value, re.IGNORECASE):  # Sequential letters
             return True
         
         # Context-aware filter (Enhancement #9)
@@ -1337,9 +1609,10 @@ class JSScanAdvanced:
         score_threshold = self.config.score_threshold
         min_length = self.config.min_secret_length
         if self.config.aggressive_mode:
-            entropy_threshold = max(3.5, entropy_threshold - 0.8)
-            score_threshold = max(2.0, score_threshold - 2.0)
-            min_length = max(8, min_length - 8)
+            # Don't lower entropy threshold below 4.0 to avoid massive false positives
+            entropy_threshold = max(4.0, entropy_threshold - 0.5)
+            score_threshold = max(3.0, score_threshold - 1.0)
+            min_length = max(12, min_length - 8)
         
         # 1. Pattern detection
         # Check if this line is a comment (lowers confidence for secrets in comments)
@@ -1348,7 +1621,7 @@ class JSScanAdvanced:
         
         for secret_type, pattern in self.compiled_patterns.items():
             for match in pattern.finditer(line):
-                value = match.group(1) if match.lastindex and match.lastindex >= 1 else match.group(0)
+                value = (match.group(1) if match.lastindex and match.lastindex >= 1 else None) or match.group(0)
                 context = line.strip()[:200]
                 
                 if self.is_false_positive(value, secret_type, context):
@@ -1433,7 +1706,7 @@ class JSScanAdvanced:
                         for secret_type, pattern in self.compiled_patterns.items():
                             match = pattern.search(decoded)
                             if match:
-                                decoded_value = match.group(1) if match.lastindex else match.group(0)
+                                decoded_value = (match.group(1) if match.lastindex else None) or match.group(0)
                                 if self.is_false_positive(decoded_value, secret_type, decoded):
                                     continue
                                 
@@ -1461,6 +1734,42 @@ class JSScanAdvanced:
         
         return findings
     
+    @staticmethod
+    def _deduplicate_findings(findings: List[SecretFinding]) -> List[SecretFinding]:
+        """
+        Deduplicate findings by (line_num, value).
+
+        Multiple detectors (AST, pattern, entropy, decoded) and multiple overlapping
+        patterns can produce several findings for the exact same secret value on the
+        same line.  We keep exactly ONE finding per (line_num, value) pair, choosing
+        the most informative one based on a priority order:
+          pattern > decoded > ast > entropy
+        Pattern findings carry entropy/score data; AST findings have score=0.
+        Within the same method, a higher score wins; ties keep the first seen.
+
+        NOTE: This does NOT touch any scanning logic – it only filters the final
+        list returned by scan_file before it reaches any report generator.
+        """
+        # Priority: lower number = higher priority (keep this one)
+        METHOD_PRIORITY = {'pattern': 0, 'decoded': 1, 'ast': 2, 'entropy': 3}
+
+        best: Dict[Tuple[int, str], SecretFinding] = {}
+
+        for f in findings:
+            key = (f.line_num, f.value)
+            if key not in best:
+                best[key] = f
+            else:
+                incumbent = best[key]
+                inc_pri = METHOD_PRIORITY.get(incumbent.detection_method, 99)
+                new_pri = METHOD_PRIORITY.get(f.detection_method, 99)
+                if new_pri < inc_pri:
+                    best[key] = f
+                elif new_pri == inc_pri and f.score > incumbent.score:
+                    best[key] = f
+
+        return list(best.values())
+
     def scan_file(self, file_path: str) -> List[SecretFinding]:
         """Scan single file"""
         findings = []
@@ -1500,7 +1809,7 @@ class JSScanAdvanced:
                         for secret_type, pattern in self.compiled_patterns.items():
                             match = pattern.search(value)
                             if match:
-                                matched_value = match.group(1) if match.lastindex else match.group(0)
+                                matched_value = (match.group(1) if match.lastindex else None) or match.group(0)
                                 if not self.is_false_positive(matched_value, secret_type, context):
                                     finding = SecretFinding(
                                         secret_type=f"{secret_type} (AST)", value=matched_value,
@@ -1522,7 +1831,36 @@ class JSScanAdvanced:
             
             if self.file_cache:
                 self.file_cache.update(file_path)
-        
+
+            # ── Deduplication ──────────────────────────────────────────────────
+            # Remove findings that share the same (line_num, value) – these arise
+            # when AST, pattern, and entropy detectors all fire on the same secret,
+            # or when multiple overlapping patterns match the same value on the
+            # same line.  We keep the single most informative finding and subtract
+            # the removed entries from the live metrics so the summary stays
+            # consistent with the actual findings list.
+            deduped = JSScanAdvanced._deduplicate_findings(findings)
+            removed = len(findings) - len(deduped)
+            if removed > 0:
+                with self._lock:
+                    # Recalculate the per-method/severity counters from what was
+                    # removed so the totals shown in the summary match the report.
+                    kept_ids = {id(f) for f in deduped}
+                    for f in findings:
+                        if id(f) not in kept_ids:
+                            self.metrics.findings_total -= 1
+                            sev = f.severity if f.severity in self.metrics.findings_by_severity else 'low'
+                            self.metrics.findings_by_severity[sev] = max(0, self.metrics.findings_by_severity[sev] - 1)
+                            method = f.detection_method if f.detection_method in self.metrics.findings_by_method else None
+                            if method:
+                                self.metrics.findings_by_method[method] = max(0, self.metrics.findings_by_method[method] - 1)
+                            if f.detection_method == 'ast':
+                                self.metrics.ast_secrets_found = max(0, self.metrics.ast_secrets_found - 1)
+                            elif f.detection_method == 'decoded':
+                                self.metrics.secrets_decoded = max(0, self.metrics.secrets_decoded - 1)
+            findings = deduped
+            # ──────────────────────────────────────────────────────────────────
+
         except Exception as e:
             self.logger.error(f"Error scanning {file_path}: {e}")
             with self._lock:
